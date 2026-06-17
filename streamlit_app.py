@@ -8,6 +8,8 @@ import streamlit as st
 
 
 PY_PER_SQM = 1 / 3.305785
+BUILDING_API_BASE = "https://apis.data.go.kr/1613000/BldRgstService_v2"
+JUSO_API_URL = "https://business.juso.go.kr/addrlink/addrLinkApi.do"
 KAKAO_SUBWAY_CATEGORY = "SW8"
 
 
@@ -20,8 +22,6 @@ class JusoResult:
     mt_yn: str
     lnbr_mnnm: str
     lnbr_slno: str
-    si_nm: str
-    sgg_nm: str
 
 
 @dataclass
@@ -67,9 +67,7 @@ def only_digits(value: str, width: int = 4) -> str:
 
 def format_year(use_apr_day: str) -> str:
     digits = re.sub(r"\D", "", clean_text(use_apr_day))
-    if len(digits) >= 4:
-        return f"{digits[:4]}년"
-    return ""
+    return f"{digits[:4]}년" if len(digits) >= 4 else ""
 
 
 def format_floors(ground: Any, underground: Any) -> str:
@@ -85,29 +83,56 @@ def format_floors(ground: Any, underground: Any) -> str:
 def format_py(area_sqm: Any) -> str:
     try:
         value = float(area_sqm or 0) * PY_PER_SQM
-    except ValueError:
+    except (TypeError, ValueError):
         return ""
-    if not value:
+    return f"{round(value):,} py" if value else ""
+
+
+def area_py_value(area_sqm: Any) -> str:
+    try:
+        value = float(area_sqm or 0) * PY_PER_SQM
+    except (TypeError, ValueError):
         return ""
-    return f"{round(value):,} py"
+    return f"{value:.1f}" if value else ""
 
 
 def display_address(juso: JusoResult) -> str:
     road = juso.road_addr
-    for prefix in ("광주광역시 ", "서울특별시 ", "경기도 ", "수원시 "):
+    prefixes = [
+        "광주광역시 ",
+        "서울특별시 ",
+        "경기도 ",
+        "수원시 ",
+        "부산광역시 ",
+        "대구광역시 ",
+        "인천광역시 ",
+        "대전광역시 ",
+        "울산광역시 ",
+        "세종특별자치시 ",
+    ]
+    for prefix in prefixes:
         road = road.replace(prefix, "")
     return road
 
 
 def request_json(url: str, params: dict[str, Any], headers: dict[str, str] | None = None) -> dict[str, Any]:
-    response = requests.get(url, params=params, headers=headers, timeout=15)
+    response = requests.get(url, params=params, headers=headers, timeout=20)
     response.raise_for_status()
     return response.json()
 
 
+def normalize_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    body = payload.get("response", {}).get("body", {})
+    items = body.get("items", {})
+    item = items.get("item", []) if isinstance(items, dict) else []
+    if isinstance(item, dict):
+        return [item]
+    return item if isinstance(item, list) else []
+
+
 def search_juso(keyword: str, juso_key: str) -> JusoResult | None:
     data = request_json(
-        "https://business.juso.go.kr/addrlink/addrLinkApi.do",
+        JUSO_API_URL,
         {
             "confmKey": juso_key,
             "currentPage": 1,
@@ -133,45 +158,33 @@ def search_juso(keyword: str, juso_key: str) -> JusoResult | None:
         mt_yn=clean_text(item.get("mtYn")),
         lnbr_mnnm=clean_text(item.get("lnbrMnnm")),
         lnbr_slno=clean_text(item.get("lnbrSlno")),
-        si_nm=clean_text(item.get("siNm")),
-        sgg_nm=clean_text(item.get("sggNm")),
     )
 
 
-def normalize_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    body = payload.get("response", {}).get("body", {})
-    items = body.get("items", {})
-    item = items.get("item", []) if isinstance(items, dict) else []
-    if isinstance(item, dict):
-        return [item]
-    return item if isinstance(item, list) else []
+def building_params(juso: JusoResult, data_key: str, rows: int = 100) -> dict[str, Any]:
+    if len(juso.adm_cd) < 10:
+        raise RuntimeError("도로명주소 결과에서 법정동코드를 찾지 못했습니다.")
+
+    return {
+        "serviceKey": data_key,
+        "sigunguCd": juso.adm_cd[:5],
+        "bjdongCd": juso.adm_cd[5:10],
+        "platGbCd": "1" if juso.mt_yn == "1" else "0",
+        "bun": only_digits(juso.lnbr_mnnm),
+        "ji": only_digits(juso.lnbr_slno),
+        "numOfRows": rows,
+        "pageNo": 1,
+        "_type": "json",
+    }
+
+
+def fetch_building_api(endpoint: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+    data = request_json(f"{BUILDING_API_BASE}/{endpoint}", params)
+    return normalize_items(data)
 
 
 def fetch_building_title(juso: JusoResult, data_key: str) -> dict[str, Any] | None:
-    if len(juso.adm_cd) < 10:
-        return None
-
-    sigungu_cd = juso.adm_cd[:5]
-    bjdong_cd = juso.adm_cd[5:10]
-    plat_gb_cd = "1" if juso.mt_yn == "1" else "0"
-    bun = only_digits(juso.lnbr_mnnm)
-    ji = only_digits(juso.lnbr_slno)
-
-    data = request_json(
-        "https://apis.data.go.kr/1613000/BldRgstService_v2/getBrTitleInfo",
-        {
-            "serviceKey": data_key,
-            "sigunguCd": sigungu_cd,
-            "bjdongCd": bjdong_cd,
-            "platGbCd": plat_gb_cd,
-            "bun": bun,
-            "ji": ji,
-            "numOfRows": 20,
-            "pageNo": 1,
-            "_type": "json",
-        },
-    )
-    items = normalize_items(data)
+    items = fetch_building_api("getBrTitleInfo", building_params(juso, data_key, rows=30))
     if not items:
         return None
 
@@ -179,11 +192,89 @@ def fetch_building_title(juso: JusoResult, data_key: str) -> dict[str, Any] | No
         name_score = 1 if clean_text(item.get("bldNm")) else 0
         try:
             area = float(item.get("totArea") or 0)
-        except ValueError:
+        except (TypeError, ValueError):
             area = 0
         return name_score, area
 
     return sorted(items, key=score, reverse=True)[0]
+
+
+def fetch_floor_outline(juso: JusoResult, data_key: str) -> pd.DataFrame:
+    rows = fetch_building_api("getBrFlrOulnInfo", building_params(juso, data_key, rows=300))
+    records: list[dict[str, str]] = []
+    for row in rows:
+        area_sqm = row.get("area")
+        records.append(
+            {
+                "동명": clean_text(row.get("dongNm")),
+                "층구분": clean_text(row.get("flrGbCdNm")),
+                "층": clean_text(row.get("flrNoNm")) or clean_text(row.get("flrNo")),
+                "구조": clean_text(row.get("strctCdNm")),
+                "용도": clean_text(row.get("mainPurpsCdNm")),
+                "면적㎡": clean_text(area_sqm),
+                "면적py": area_py_value(area_sqm),
+            }
+        )
+    return pd.DataFrame(records)
+
+
+def filter_by_dong_ho(rows: list[dict[str, Any]], dong_nm: str, ho_nm: str) -> list[dict[str, Any]]:
+    dong_key = clean_text(dong_nm).replace("동", "")
+    ho_key = clean_text(ho_nm).replace("호", "")
+    filtered = []
+    for row in rows:
+        row_dong = clean_text(row.get("dongNm")).replace("동", "")
+        row_ho = clean_text(row.get("hoNm")).replace("호", "")
+        if dong_key and dong_key not in row_dong:
+            continue
+        if ho_key and ho_key not in row_ho:
+            continue
+        filtered.append(row)
+    return filtered
+
+
+def fetch_private_unit(juso: JusoResult, data_key: str, dong_nm: str, ho_nm: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    params = building_params(juso, data_key, rows=300)
+    if dong_nm:
+        params["dongNm"] = dong_nm
+    if ho_nm:
+        params["hoNm"] = ho_nm
+
+    expos_rows = fetch_building_api("getBrExposInfo", params)
+    pubuse_rows = fetch_building_api("getBrExposPubuseAreaInfo", params)
+
+    if dong_nm or ho_nm:
+        expos_rows = filter_by_dong_ho(expos_rows, dong_nm, ho_nm)
+        pubuse_rows = filter_by_dong_ho(pubuse_rows, dong_nm, ho_nm)
+
+    expos_records = []
+    for row in expos_rows:
+        area_sqm = row.get("area") or row.get("exposArea")
+        expos_records.append(
+            {
+                "동명": clean_text(row.get("dongNm")),
+                "호명": clean_text(row.get("hoNm")),
+                "층": clean_text(row.get("flrNoNm")) or clean_text(row.get("flrNo")),
+                "전유면적㎡": clean_text(area_sqm),
+                "전유면적py": area_py_value(area_sqm),
+                "용도": clean_text(row.get("mainPurpsCdNm")),
+            }
+        )
+
+    pubuse_records = []
+    for row in pubuse_rows:
+        area_sqm = row.get("area")
+        pubuse_records.append(
+            {
+                "동명": clean_text(row.get("dongNm")),
+                "호명": clean_text(row.get("hoNm")),
+                "구분": clean_text(row.get("exposPubuseGbCdNm")),
+                "공용면적㎡": clean_text(area_sqm),
+                "공용면적py": area_py_value(area_sqm),
+            }
+        )
+
+    return pd.DataFrame(expos_records), pd.DataFrame(pubuse_records)
 
 
 def geocode_kakao(address: str, kakao_key: str) -> tuple[float, float] | None:
@@ -227,7 +318,7 @@ def nearest_subway(address: str, kakao_key: str) -> tuple[str, str]:
     return station, f"도보 {minutes}분"
 
 
-def lookup(address: str, juso_key: str, data_key: str, kakao_key: str) -> BuildingResult:
+def lookup(address: str, juso_key: str, data_key: str, kakao_key: str) -> tuple[JusoResult, BuildingResult, pd.DataFrame]:
     juso = search_juso(address, juso_key)
     if not juso:
         raise RuntimeError("주소를 찾지 못했습니다.")
@@ -236,8 +327,9 @@ def lookup(address: str, juso_key: str, data_key: str, kakao_key: str) -> Buildi
     if not building:
         raise RuntimeError("건축물대장 표제부를 찾지 못했습니다.")
 
+    floors_df = fetch_floor_outline(juso, data_key)
     station, walk_time = nearest_subway(juso.road_addr, kakao_key) if kakao_key else ("", "")
-    return BuildingResult(
+    result = BuildingResult(
         name=clean_text(building.get("bldNm")) or "건물명 없음",
         address=display_address(juso),
         approval_year=format_year(clean_text(building.get("useAprDay"))),
@@ -246,6 +338,7 @@ def lookup(address: str, juso_key: str, data_key: str, kakao_key: str) -> Buildi
         station=station,
         walk_time=walk_time,
     )
+    return juso, result, floors_df
 
 
 def render_card(result: BuildingResult) -> None:
@@ -322,13 +415,18 @@ with st.sidebar:
         juso_key = st.text_input("도로명주소 API 승인키", value=juso_secret, type="password")
         data_key = st.text_input("공공데이터포털 서비스키", value=data_secret, type="password")
         kakao_key = st.text_input("Kakao REST API 키 (선택)", value=kakao_secret, type="password")
-    st.caption("Kakao 키가 없으면 역/도보시간은 비워둡니다.")
+    st.caption("Kakao 키가 없으면 역/도보시간은 비워집니다.")
 
 addresses_text = st.text_area(
     "매물 주소",
     height=140,
     placeholder="예: 경기도 수원시 영통구 효원로 400\n여러 건은 줄바꿈으로 입력",
 )
+
+with st.expander("집합건물 전유부 조회 옵션"):
+    st.caption("집합건물은 주소만으로 전체 전유부가 여럿 나올 수 있습니다. 특정 호실이면 동명/호명을 입력하세요.")
+    unit_dong = st.text_input("동명 (선택)", placeholder="예: 101동 또는 A동")
+    unit_ho = st.text_input("호명 (선택)", placeholder="예: 301호")
 
 run = st.button("조회", type="primary")
 
@@ -339,14 +437,25 @@ if run:
     elif not addresses:
         st.error("주소를 입력해 주세요.")
     else:
-        results: list[dict[str, str]] = []
-        cols = st.columns(3)
+        summary_rows: list[dict[str, str]] = []
+        floor_tables: list[pd.DataFrame] = []
+        expos_tables: list[pd.DataFrame] = []
+        pubuse_tables: list[pd.DataFrame] = []
+
+        tab_cards, tab_floors, tab_units = st.tabs(["카드 결과", "층별 정보", "집합건물 전유부"])
+
+        with tab_cards:
+            cols = st.columns(3)
+
         for index, address in enumerate(addresses):
             try:
-                result = lookup(address, juso_key, data_key, kakao_key)
-                with cols[index % 3]:
-                    render_card(result)
-                results.append(
+                juso, result, floors_df = lookup(address, juso_key, data_key, kakao_key)
+
+                with tab_cards:
+                    with cols[index % 3]:
+                        render_card(result)
+
+                summary_rows.append(
                     {
                         "입력주소": address,
                         "건물명": result.name,
@@ -358,16 +467,70 @@ if run:
                         "연면적": result.total_area_py,
                     }
                 )
+
+                if not floors_df.empty:
+                    floors_df.insert(0, "입력주소", address)
+                    floor_tables.append(floors_df)
+
+                if unit_dong or unit_ho:
+                    expos_df, pubuse_df = fetch_private_unit(juso, data_key, unit_dong, unit_ho)
+                    if not expos_df.empty:
+                        expos_df.insert(0, "입력주소", address)
+                        expos_tables.append(expos_df)
+                    if not pubuse_df.empty:
+                        pubuse_df.insert(0, "입력주소", address)
+                        pubuse_tables.append(pubuse_df)
+
             except Exception as exc:
                 st.warning(f"{address}: {exc}")
 
-        if results:
-            df = pd.DataFrame(results)
-            st.subheader("표 형식 결과")
-            st.dataframe(df, use_container_width=True, hide_index=True)
-            st.download_button(
-                "CSV 다운로드",
-                data=df.to_csv(index=False).encode("utf-8-sig"),
-                file_name="building_register_results.csv",
-                mime="text/csv",
-            )
+        if summary_rows:
+            summary_df = pd.DataFrame(summary_rows)
+            with tab_cards:
+                st.subheader("표 형식 결과")
+                st.dataframe(summary_df, use_container_width=True, hide_index=True)
+                st.download_button(
+                    "요약 CSV 다운로드",
+                    data=summary_df.to_csv(index=False).encode("utf-8-sig"),
+                    file_name="building_register_summary.csv",
+                    mime="text/csv",
+                )
+
+        with tab_floors:
+            if floor_tables:
+                floor_df = pd.concat(floor_tables, ignore_index=True)
+                st.dataframe(floor_df, use_container_width=True, hide_index=True)
+                st.download_button(
+                    "층별 정보 CSV 다운로드",
+                    data=floor_df.to_csv(index=False).encode("utf-8-sig"),
+                    file_name="building_floor_outline.csv",
+                    mime="text/csv",
+                )
+            else:
+                st.info("층별 정보가 없습니다.")
+
+        with tab_units:
+            if not (unit_dong or unit_ho):
+                st.info("전유부 조회가 필요하면 동명 또는 호명을 입력하고 다시 조회하세요.")
+            if expos_tables:
+                expos_df = pd.concat(expos_tables, ignore_index=True)
+                st.subheader("전유부")
+                st.dataframe(expos_df, use_container_width=True, hide_index=True)
+                st.download_button(
+                    "전유부 CSV 다운로드",
+                    data=expos_df.to_csv(index=False).encode("utf-8-sig"),
+                    file_name="building_private_unit.csv",
+                    mime="text/csv",
+                )
+            if pubuse_tables:
+                pubuse_df = pd.concat(pubuse_tables, ignore_index=True)
+                st.subheader("전유공용면적")
+                st.dataframe(pubuse_df, use_container_width=True, hide_index=True)
+                st.download_button(
+                    "전유공용면적 CSV 다운로드",
+                    data=pubuse_df.to_csv(index=False).encode("utf-8-sig"),
+                    file_name="building_private_common_area.csv",
+                    mime="text/csv",
+                )
+            if (unit_dong or unit_ho) and not expos_tables and not pubuse_tables:
+                st.info("해당 동/호 전유부 정보가 없거나 조회되지 않았습니다.")
