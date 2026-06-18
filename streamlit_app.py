@@ -167,6 +167,14 @@ def normalize_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return item if isinstance(item, list) else []
 
 
+def ensure_success_response(payload: dict[str, Any]) -> None:
+    header = payload.get("response", {}).get("header", {})
+    code = clean_text(header.get("resultCode"))
+    message = clean_text(header.get("resultMsg"))
+    if code and code not in {"00", "0", "NORMAL_CODE"}:
+        raise ApiRequestError(f"공공데이터포털 응답 오류: {code} {message}")
+
+
 def search_juso(keyword: str, juso_key: str) -> JusoResult | None:
     data = request_json(
         JUSO_API_URL,
@@ -198,12 +206,21 @@ def search_juso(keyword: str, juso_key: str) -> JusoResult | None:
     )
 
 
-def building_params(juso: JusoResult, data_key: str, rows: int = 100) -> dict[str, Any]:
+def data_key_candidates(data_key: str) -> list[str]:
+    raw_key = clean_text(data_key)
+    decoded_key = unquote(raw_key)
+    keys = [raw_key]
+    if decoded_key and decoded_key != raw_key:
+        keys.append(decoded_key)
+    return keys
+
+
+def building_params(juso: JusoResult, service_key: str, rows: int = 100) -> dict[str, Any]:
     if len(juso.adm_cd) < 10:
         raise RuntimeError("도로명주소 결과에서 법정동코드를 찾지 못했습니다.")
 
     return {
-        "serviceKey": unquote(data_key),
+        "serviceKey": service_key,
         "sigunguCd": juso.adm_cd[:5],
         "bjdongCd": juso.adm_cd[5:10],
         "platGbCd": "1" if juso.mt_yn == "1" else "0",
@@ -215,13 +232,44 @@ def building_params(juso: JusoResult, data_key: str, rows: int = 100) -> dict[st
     }
 
 
-def fetch_building_api(endpoint: str, params: dict[str, Any]) -> list[dict[str, Any]]:
-    data = request_json(f"{BUILDING_API_BASE}/{endpoint}", params)
-    return normalize_items(data)
+def fetch_building_api(endpoint: str, juso: JusoResult, data_key: str, rows: int = 100) -> list[dict[str, Any]]:
+    errors: list[str] = []
+    for index, service_key in enumerate(data_key_candidates(data_key), start=1):
+        params = building_params(juso, service_key, rows=rows)
+        try:
+            data = request_json(f"{BUILDING_API_BASE}/{endpoint}", params)
+            ensure_success_response(data)
+            return normalize_items(data)
+        except ApiRequestError as exc:
+            errors.append(f"{index}차 시도 실패: {exc}")
+            continue
+    raise ApiRequestError("건축물대장 API 호출이 모두 실패했습니다. " + " / ".join(errors))
+
+
+def fetch_building_api_with_extra(
+    endpoint: str,
+    juso: JusoResult,
+    data_key: str,
+    rows: int = 100,
+    extra_params: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    errors: list[str] = []
+    for index, service_key in enumerate(data_key_candidates(data_key), start=1):
+        params = building_params(juso, service_key, rows=rows)
+        if extra_params:
+            params.update(extra_params)
+        try:
+            data = request_json(f"{BUILDING_API_BASE}/{endpoint}", params)
+            ensure_success_response(data)
+            return normalize_items(data)
+        except ApiRequestError as exc:
+            errors.append(f"{index}차 시도 실패: {exc}")
+            continue
+    raise ApiRequestError("건축물대장 API 호출이 모두 실패했습니다. " + " / ".join(errors))
 
 
 def fetch_building_title(juso: JusoResult, data_key: str) -> dict[str, Any] | None:
-    items = fetch_building_api("getBrTitleInfo", building_params(juso, data_key, rows=30))
+    items = fetch_building_api("getBrTitleInfo", juso, data_key, rows=30)
     if not items:
         return None
 
@@ -237,7 +285,7 @@ def fetch_building_title(juso: JusoResult, data_key: str) -> dict[str, Any] | No
 
 
 def fetch_floor_outline(juso: JusoResult, data_key: str) -> pd.DataFrame:
-    rows = fetch_building_api("getBrFlrOulnInfo", building_params(juso, data_key, rows=300))
+    rows = fetch_building_api("getBrFlrOulnInfo", juso, data_key, rows=300)
     records: list[dict[str, str]] = []
     for row in rows:
         area_sqm = row.get("area")
@@ -271,14 +319,16 @@ def filter_by_dong_ho(rows: list[dict[str, Any]], dong_nm: str, ho_nm: str) -> l
 
 
 def fetch_private_unit(juso: JusoResult, data_key: str, dong_nm: str, ho_nm: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    params = building_params(juso, data_key, rows=300)
+    extra_params = {}
     if dong_nm:
-        params["dongNm"] = dong_nm
+        extra_params["dongNm"] = dong_nm
     if ho_nm:
-        params["hoNm"] = ho_nm
+        extra_params["hoNm"] = ho_nm
 
-    expos_rows = fetch_building_api("getBrExposInfo", params)
-    pubuse_rows = fetch_building_api("getBrExposPubuseAreaInfo", params)
+    expos_rows = fetch_building_api_with_extra("getBrExposInfo", juso, data_key, rows=300, extra_params=extra_params)
+    pubuse_rows = fetch_building_api_with_extra(
+        "getBrExposPubuseAreaInfo", juso, data_key, rows=300, extra_params=extra_params
+    )
 
     if dong_nm or ho_nm:
         expos_rows = filter_by_dong_ho(expos_rows, dong_nm, ho_nm)
