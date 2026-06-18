@@ -436,14 +436,15 @@ def render_card(result: BuildingResult) -> None:
     walk_line = result.walk_time or "도보시간 없음"
     st.markdown(
         f"""
-        <div class="building-card">
-          <div class="card-title">{result.name}</div>
-          <div class="card-row">{result.address}</div>
-          <div class="card-row">{station_line}<br>{walk_line}</div>
-          <div class="card-row">{result.approval_year}</div>
-          <div class="card-row">{result.floors}</div>
-          <div class="card-row">{result.total_area_py}</div>
-        </div>
+        <table class="building-card">
+          <tr><td class="card-title">{result.name}</td></tr>
+          <tr><td class="card-empty"></td></tr>
+          <tr><td class="card-row">{result.address}</td></tr>
+          <tr><td class="card-row">{station_line} {walk_line}</td></tr>
+          <tr><td class="card-row">{result.approval_year}</td></tr>
+          <tr><td class="card-row">{result.floors}</td></tr>
+          <tr><td class="card-row">{result.total_area_py}</td></tr>
+        </table>
         """,
         unsafe_allow_html=True,
     )
@@ -461,6 +462,12 @@ st.markdown(
         background: #fff;
         text-align: center;
         font-family: 'Malgun Gothic', sans-serif;
+        border-collapse: collapse;
+      }
+      .building-card td {
+        vertical-align: middle;
+        text-align: center;
+        padding: 7px 8px;
       }
       .card-title {
         background: #22577f;
@@ -472,12 +479,12 @@ st.markdown(
       .card-row {
         min-height: 42px;
         border-top: 1px dotted #777;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        padding: 7px 8px;
         font-size: 24px;
         line-height: 1.45;
+      }
+      .card-empty {
+        height: 18px;
+        border-top: 1px dotted #777;
       }
     </style>
     """,
