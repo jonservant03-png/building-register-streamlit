@@ -9,7 +9,7 @@ import streamlit as st
 
 
 PY_PER_SQM = 1 / 3.305785
-BUILDING_API_BASE = "https://apis.data.go.kr/1613000/BldRgstService_v2"
+BUILDING_API_BASE = "https://apis.data.go.kr/1613000/BldRgstHubService"
 JUSO_API_URL = "https://business.juso.go.kr/addrlink/addrLinkApi.do"
 KAKAO_SUBWAY_CATEGORY = "SW8"
 
