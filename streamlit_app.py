@@ -415,7 +415,10 @@ def lookup(address: str, juso_key: str, data_key: str, kakao_key: str) -> tuple[
         raise RuntimeError("건축물대장 표제부를 찾지 못했습니다.")
 
     floors_df = fetch_floor_outline(juso, data_key)
-    station, walk_time = nearest_subway(juso.road_addr, kakao_key) if kakao_key else ("", "")
+    try:
+        station, walk_time = nearest_subway(juso.road_addr, kakao_key) if kakao_key else ("", "")
+    except Exception:
+        station, walk_time = "", ""
     result = BuildingResult(
         name=clean_text(building.get("bldNm")) or "건물명 없음",
         address=display_address(juso),
