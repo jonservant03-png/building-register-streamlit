@@ -376,16 +376,31 @@ def geocode_kakao(address: str, kakao_key: str) -> tuple[float, float] | None:
     return float(docs[0]["x"]), float(docs[0]["y"])
 
 
-def nearest_subway(address: str, kakao_key: str) -> tuple[str, str]:
-    if not kakao_key:
-        return "", ""
-    point = geocode_kakao(address, kakao_key)
-    if not point:
-        return "", ""
+WALK_MINUTE_THRESHOLD = 20
 
-    x, y = point
+
+def format_station_name(place_name: str) -> str:
+    """Kakao place_name '역이름 노선' -> '노선 역이름' 순서로 재정렬."""
+    text = clean_text(place_name)
+    parts = text.rsplit(" ", 1)
+    if len(parts) == 2:
+        station, line = parts
+        return f"{line} {station}"
+    return text
+
+
+def kakao_local_search(path: str, params: dict[str, Any], kakao_key: str) -> list[dict[str, Any]]:
     data = request_json(
-        "https://dapi.kakao.com/v2/local/search/category.json",
+        f"https://dapi.kakao.com/v2/local/{path}",
+        params,
+        {"Authorization": f"KakaoAK {kakao_key}"},
+    )
+    return data.get("documents", [])
+
+
+def find_nearest_subway(x: float, y: float, kakao_key: str) -> tuple[str, int] | None:
+    docs = kakao_local_search(
+        "search/category.json",
         {
             "category_group_code": KAKAO_SUBWAY_CATEGORY,
             "x": x,
@@ -394,15 +409,74 @@ def nearest_subway(address: str, kakao_key: str) -> tuple[str, str]:
             "sort": "distance",
             "size": 1,
         },
-        {"Authorization": f"KakaoAK {kakao_key}"},
+        kakao_key,
     )
-    docs = data.get("documents", [])
     if not docs:
+        return None
+    return docs[0].get("place_name", ""), int(docs[0].get("distance") or 0)
+
+
+def find_nearest_landmark(x: float, y: float, kakao_key: str) -> str:
+    """교통시설(터미널/기차역) > 관공서 > 공원·랜드마크 순으로 가장 가까운 시설명."""
+
+    def nearest_keyword(keywords: list[str]) -> str:
+        best_name, best_dist = "", None
+        for kw in keywords:
+            docs = kakao_local_search(
+                "search/keyword.json",
+                {"query": kw, "x": x, "y": y, "radius": 5000, "sort": "distance", "size": 1},
+                kakao_key,
+            )
+            if docs:
+                dist = int(docs[0].get("distance") or 0)
+                if best_dist is None or dist < best_dist:
+                    best_name, best_dist = clean_text(docs[0].get("place_name")), dist
+        return best_name
+
+    def nearest_category(code: str) -> str:
+        docs = kakao_local_search(
+            "search/category.json",
+            {"category_group_code": code, "x": x, "y": y, "radius": 5000, "sort": "distance", "size": 1},
+            kakao_key,
+        )
+        return clean_text(docs[0].get("place_name")) if docs else ""
+
+    # 1) 교통시설
+    name = nearest_keyword(["터미널", "기차역"])
+    if name:
+        return name
+    # 2) 관공서(공공기관)
+    name = nearest_category("PO3")
+    if name:
+        return name
+    # 3) 공원·랜드마크(관광명소)
+    return nearest_category("AT4")
+
+
+def nearest_subway(address: str, kakao_key: str) -> tuple[str, str]:
+    if not kakao_key:
         return "", ""
-    station = docs[0].get("place_name", "")
-    distance_m = int(docs[0].get("distance") or 0)
-    minutes = max(1, round(distance_m / 67))
-    return station, f"도보 {minutes}분"
+    point = geocode_kakao(address, kakao_key)
+    if not point:
+        return "", ""
+
+    x, y = point
+    subway = find_nearest_subway(x, y, kakao_key)
+    if subway:
+        place_name, distance_m = subway
+        minutes = max(1, round(distance_m / 67))
+        if minutes <= WALK_MINUTE_THRESHOLD:
+            return format_station_name(place_name), f"도보 {minutes}분"
+
+    landmark = find_nearest_landmark(x, y, kakao_key)
+    if landmark:
+        return f"{landmark} 인근", ""
+
+    if subway:
+        place_name, distance_m = subway
+        minutes = max(1, round(distance_m / 67))
+        return format_station_name(place_name), f"도보 {minutes}분"
+    return "", ""
 
 
 def lookup(address: str, juso_key: str, data_key: str, kakao_key: str) -> tuple[JusoResult, BuildingResult, pd.DataFrame]:
@@ -432,15 +506,15 @@ def lookup(address: str, juso_key: str, data_key: str, kakao_key: str) -> tuple[
 
 
 def render_card(result: BuildingResult) -> None:
-    station_line = result.station or "역 정보 없음"
-    walk_line = result.walk_time or "도보시간 없음"
+    transit_parts = [p for p in (result.station, result.walk_time) if p]
+    transit_line = " ".join(transit_parts) if transit_parts else "역 정보 없음"
     st.markdown(
         f"""
         <table class="building-card">
           <tr><td class="card-title">{result.name}</td></tr>
           <tr><td class="card-empty"></td></tr>
           <tr><td class="card-row">{result.address}</td></tr>
-          <tr><td class="card-row">{station_line} {walk_line}</td></tr>
+          <tr><td class="card-row">{transit_line}</td></tr>
           <tr><td class="card-row">{result.approval_year}</td></tr>
           <tr><td class="card-row">{result.floors}</td></tr>
           <tr><td class="card-row">{result.total_area_py}</td></tr>
