@@ -1,6 +1,7 @@
 import re
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 import pandas as pd
 import requests
@@ -11,6 +12,10 @@ PY_PER_SQM = 1 / 3.305785
 BUILDING_API_BASE = "https://apis.data.go.kr/1613000/BldRgstService_v2"
 JUSO_API_URL = "https://business.juso.go.kr/addrlink/addrLinkApi.do"
 KAKAO_SUBWAY_CATEGORY = "SW8"
+
+
+class ApiRequestError(RuntimeError):
+    pass
 
 
 @dataclass
@@ -37,6 +42,18 @@ class BuildingResult:
 
 def clean_text(value: Any) -> str:
     return str(value or "").strip()
+
+
+def sanitize_url(url: str) -> str:
+    parts = urlsplit(url)
+    safe_query_parts = []
+    for part in parts.query.split("&"):
+        if part.lower().startswith("servicekey=") or part.lower().startswith("confmkey="):
+            key = part.split("=", 1)[0]
+            safe_query_parts.append(f"{key}=***")
+        else:
+            safe_query_parts.append(part)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, "&".join(safe_query_parts), parts.fragment))
 
 
 def secret_value(name: str, default: str = "") -> str:
@@ -116,9 +133,29 @@ def display_address(juso: JusoResult) -> str:
 
 
 def request_json(url: str, params: dict[str, Any], headers: dict[str, str] | None = None) -> dict[str, Any]:
-    response = requests.get(url, params=params, headers=headers, timeout=20)
-    response.raise_for_status()
-    return response.json()
+    try:
+        response = requests.get(url, params=params, headers=headers, timeout=20)
+    except requests.RequestException as exc:
+        raise ApiRequestError(f"API 연결 실패: {exc}") from exc
+
+    if response.status_code >= 400:
+        safe_url = sanitize_url(response.url)
+        body = clean_text(response.text)[:300]
+        if "BldRgstService" in url and response.status_code >= 500:
+            raise ApiRequestError(
+                "건축물대장 API 서버 오류가 발생했습니다. "
+                "공공데이터포털에서 '국토교통부_건축물대장정보 서비스' 활용신청이 승인됐는지, "
+                "서비스키를 Decoding 키 또는 일반 인증키로 넣었는지 확인한 뒤 다시 시도하세요. "
+                f"상태코드: {response.status_code}, URL: {safe_url}, 응답: {body}"
+            )
+        raise ApiRequestError(f"API 요청 실패. 상태코드: {response.status_code}, URL: {safe_url}, 응답: {body}")
+
+    try:
+        return response.json()
+    except ValueError as exc:
+        safe_url = sanitize_url(response.url)
+        body = clean_text(response.text)[:300]
+        raise ApiRequestError(f"JSON 응답을 읽지 못했습니다. URL: {safe_url}, 응답: {body}") from exc
 
 
 def normalize_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -166,7 +203,7 @@ def building_params(juso: JusoResult, data_key: str, rows: int = 100) -> dict[st
         raise RuntimeError("도로명주소 결과에서 법정동코드를 찾지 못했습니다.")
 
     return {
-        "serviceKey": data_key,
+        "serviceKey": unquote(data_key),
         "sigunguCd": juso.adm_cd[:5],
         "bjdongCd": juso.adm_cd[5:10],
         "platGbCd": "1" if juso.mt_yn == "1" else "0",
