@@ -114,22 +114,13 @@ def area_py_value(area_sqm: Any) -> str:
 
 
 def display_address(juso: JusoResult) -> str:
-    road = juso.road_addr
-    prefixes = [
-        "광주광역시 ",
-        "서울특별시 ",
-        "경기도 ",
-        "수원시 ",
-        "부산광역시 ",
-        "대구광역시 ",
-        "인천광역시 ",
-        "대전광역시 ",
-        "울산광역시 ",
-        "세종특별자치시 ",
-    ]
-    for prefix in prefixes:
-        road = road.replace(prefix, "")
-    return road
+    """'00구 00길 0' 형태로 간소화: 도/시 및 맨 뒤 (동) 표기 제거."""
+    road = re.sub(r"\s*\(.*?\)\s*$", "", clean_text(juso.road_addr)).strip()
+    tokens = road.split()
+    # 도(경기도)·시(용인시/광역시/특별자치시) 레벨은 구/군/도로명이 나올 때까지 제거
+    while tokens and (tokens[0].endswith("도") or tokens[0].endswith("시")):
+        tokens.pop(0)
+    return " ".join(tokens)
 
 
 def request_json(url: str, params: dict[str, Any], headers: dict[str, str] | None = None) -> dict[str, Any]:
