@@ -416,41 +416,39 @@ def find_nearest_subway(x: float, y: float, kakao_key: str) -> tuple[str, int] |
     return docs[0].get("place_name", ""), int(docs[0].get("distance") or 0)
 
 
-def find_nearest_landmark(x: float, y: float, kakao_key: str) -> str:
-    """교통시설(터미널/기차역) > 관공서 > 공원·랜드마크 순으로 가장 가까운 시설명."""
+LANDMARK_RADIUS = 3000  # '인근'으로 부를 수 있는 최대 거리(m)
 
-    def nearest_keyword(keywords: list[str]) -> str:
+
+def find_nearest_landmark(x: float, y: float, kakao_key: str) -> str:
+    """교통시설(터미널/기차역) > 관공서 > 공원·랜드마크 순으로 가장 가까운 시설명.
+
+    Kakao 키워드 검색은 radius/거리정렬을 무시하고 인기 결과를 돌려주는 경우가
+    있어, 응답의 distance 값으로 반경 내 최근접만 직접 골라낸다.
+    """
+
+    def nearest(path: str, queries: list[dict[str, Any]]) -> str:
         best_name, best_dist = "", None
-        for kw in keywords:
-            docs = kakao_local_search(
-                "search/keyword.json",
-                {"query": kw, "x": x, "y": y, "radius": 5000, "sort": "distance", "size": 1},
-                kakao_key,
-            )
-            if docs:
-                dist = int(docs[0].get("distance") or 0)
+        for extra in queries:
+            params = {"x": x, "y": y, "radius": LANDMARK_RADIUS, "sort": "distance", "size": 15}
+            params.update(extra)
+            for doc in kakao_local_search(path, params, kakao_key):
+                dist = int(doc.get("distance") or 0)
+                if not dist or dist > LANDMARK_RADIUS:
+                    continue
                 if best_dist is None or dist < best_dist:
-                    best_name, best_dist = clean_text(docs[0].get("place_name")), dist
+                    best_name, best_dist = clean_text(doc.get("place_name")), dist
         return best_name
 
-    def nearest_category(code: str) -> str:
-        docs = kakao_local_search(
-            "search/category.json",
-            {"category_group_code": code, "x": x, "y": y, "radius": 5000, "sort": "distance", "size": 1},
-            kakao_key,
-        )
-        return clean_text(docs[0].get("place_name")) if docs else ""
-
-    # 1) 교통시설
-    name = nearest_keyword(["터미널", "기차역"])
+    # 1) 교통시설(터미널/기차역)
+    name = nearest("search/keyword.json", [{"query": "터미널"}, {"query": "기차역"}])
     if name:
         return name
     # 2) 관공서(공공기관)
-    name = nearest_category("PO3")
+    name = nearest("search/category.json", [{"category_group_code": "PO3"}])
     if name:
         return name
     # 3) 공원·랜드마크(관광명소)
-    return nearest_category("AT4")
+    return nearest("search/category.json", [{"category_group_code": "AT4"}])
 
 
 def nearest_subway(address: str, kakao_key: str) -> tuple[str, str]:
