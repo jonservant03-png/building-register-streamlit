@@ -413,12 +413,20 @@ LANDMARK_RADIUS = 3000  # '인근'으로 부를 수 있는 최대 거리(m)
 LANDMARK_NAME_EXCLUDE = ("화물",)  # '양재화물터미널' 등 랜드마크로 부적절한 명칭 제외
 
 
+def subway_label(subway: tuple[str, int]) -> tuple[str, str]:
+    """지하철 (역명, 거리m) -> ('노선 역이름', '도보 NN분'). 20분 초과여도 분 단위 표기."""
+    place_name, distance_m = subway
+    minutes = max(1, round(distance_m / 67))
+    return format_station_name(place_name), f"도보 {minutes}분"
+
+
 def find_nearest_landmark(
     x: float, y: float, kakao_key: str, subway: tuple[str, int] | None = None
-) -> str:
-    """교통시설(지하철/버스터미널) > 관공서 > 공원·랜드마크 순으로 '인근' 표기용 명칭 반환.
+) -> tuple[str, str]:
+    """교통시설(지하철/버스터미널) > 관공서 > 공원·랜드마크 순으로 표기 반환.
 
-    Kakao 응답의 distance 값으로 반경 내 최근접만 직접 골라낸다.
+    지하철역이 당첨이면 ('노선 역이름', '도보 NN분'), 그 외(터미널/시청/공원 등)는
+    ('OO 인근', '') 형태. Kakao 응답의 distance 값으로 반경 내 최근접만 고른다.
     """
 
     def nearest(path: str, queries: list[dict[str, Any]]) -> tuple[str, int | None]:
@@ -437,24 +445,28 @@ def find_nearest_landmark(
                     best_name, best_dist = name, dist
         return best_name, best_dist
 
-    # 1) 교통시설: 지하철역 + 버스터미널 중 최근접 (화물터미널 등 제외)
-    candidates: list[tuple[str, int]] = []
+    # 1) 교통시설: 지하철역 vs 버스터미널 중 최근접 (화물터미널 등 제외)
+    transit: list[tuple[str, str, int]] = []  # (kind, name, dist)
     if subway:
-        place_name, dist = subway
-        candidates.append((format_station_name(place_name), dist))
+        transit.append(("subway", subway[0], subway[1]))
     term_name, term_dist = nearest("search/keyword.json", [{"query": "터미널"}])
     if term_name and term_dist is not None:
-        candidates.append((term_name, term_dist))
-    if candidates:
-        return min(candidates, key=lambda c: c[1])[0]
+        transit.append(("terminal", term_name, term_dist))
+    if transit:
+        kind, name, dist = min(transit, key=lambda t: t[2])
+        if kind == "subway":
+            return subway_label((name, dist))
+        return f"{name} 인근", ""
 
     # 2) 관공서(공공기관)
     name, _ = nearest("search/category.json", [{"category_group_code": "PO3"}])
     if name:
-        return name
+        return f"{name} 인근", ""
     # 3) 공원·랜드마크(관광명소)
     name, _ = nearest("search/category.json", [{"category_group_code": "AT4"}])
-    return name
+    if name:
+        return f"{name} 인근", ""
+    return "", ""
 
 
 def nearest_subway(address: str, kakao_key: str) -> tuple[str, str]:
@@ -467,19 +479,16 @@ def nearest_subway(address: str, kakao_key: str) -> tuple[str, str]:
     x, y = point
     subway = find_nearest_subway(x, y, kakao_key)
     if subway:
-        place_name, distance_m = subway
-        minutes = max(1, round(distance_m / 67))
+        minutes = max(1, round(subway[1] / 67))
         if minutes <= WALK_MINUTE_THRESHOLD:
-            return format_station_name(place_name), f"도보 {minutes}분"
+            return subway_label(subway)
 
-    landmark = find_nearest_landmark(x, y, kakao_key, subway=subway)
-    if landmark:
-        return f"{landmark} 인근", ""
+    station, walk = find_nearest_landmark(x, y, kakao_key, subway=subway)
+    if station:
+        return station, walk
 
     if subway:
-        place_name, distance_m = subway
-        minutes = max(1, round(distance_m / 67))
-        return format_station_name(place_name), f"도보 {minutes}분"
+        return subway_label(subway)
     return "", ""
 
 
