@@ -494,6 +494,39 @@ def lookup(address: str, juso_key: str, data_key: str, kakao_key: str) -> tuple[
     return juso, result, floors_df
 
 
+def render_debug(address: str, kakao_key: str) -> None:
+    """임시 진단: 좌표 + 랜드마크 후보 검색 결과(이름/거리)를 화면에 표시."""
+    st.markdown(f"#### 🔧 디버그: {address}")
+    if not kakao_key:
+        st.info("Kakao 키가 없어 디버그를 건너뜁니다.")
+        return
+    point = geocode_kakao(address, kakao_key)
+    st.write("좌표 (x=경도, y=위도):", point)
+    if not point:
+        st.warning("좌표를 못 찾음 → geocode 문제")
+        return
+    x, y = point
+    searches = [
+        ("터미널 (keyword)", "search/keyword.json", {"query": "터미널"}),
+        ("기차역 (keyword)", "search/keyword.json", {"query": "기차역"}),
+        ("공공기관 PO3", "search/category.json", {"category_group_code": "PO3"}),
+        ("관광명소 AT4", "search/category.json", {"category_group_code": "AT4"}),
+        ("지하철 SW8", "search/category.json", {"category_group_code": "SW8"}),
+    ]
+    for label, path, extra in searches:
+        params = {"x": x, "y": y, "radius": 3000, "sort": "distance", "size": 5}
+        params.update(extra)
+        try:
+            docs = kakao_local_search(path, params, kakao_key)
+            rows = [
+                {"place_name": d.get("place_name"), "distance": d.get("distance")}
+                for d in docs
+            ]
+            st.write(f"[{label}] ({len(rows)}건)", rows or "결과 없음")
+        except Exception as exc:
+            st.write(f"[{label}] 오류:", str(exc))
+
+
 def render_card(result: BuildingResult) -> None:
     transit_parts = [p for p in (result.station, result.walk_time) if p]
     transit_line = " ".join(transit_parts) if transit_parts else "역 정보 없음"
@@ -576,6 +609,7 @@ with st.sidebar:
         data_key = st.text_input("공공데이터포털 서비스키", value=data_secret, type="password")
         kakao_key = st.text_input("Kakao REST API 키 (선택)", value=kakao_secret, type="password")
     st.caption("Kakao 키가 없으면 역/도보시간은 비워집니다.")
+    debug_mode = st.checkbox("🔧 디버그 표시 (임시)", value=False)
 
 addresses_text = st.text_area(
     "매물 주소",
@@ -614,6 +648,8 @@ if run:
                 with tab_cards:
                     with cols[index % 3]:
                         render_card(result)
+                    if debug_mode:
+                        render_debug(juso.road_addr, kakao_key)
 
                 summary_rows.append(
                     {
