@@ -1,17 +1,20 @@
+import io
+import json
 import re
+import shlex
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import unquote, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, unquote, urlsplit, urlunsplit
 
 import pandas as pd
 import requests
 import streamlit as st
 
-
 PY_PER_SQM = 1 / 3.305785
 BUILDING_API_BASE = "https://apis.data.go.kr/1613000/BldRgstHubService"
 JUSO_API_URL = "https://business.juso.go.kr/addrlink/addrLinkApi.do"
 KAKAO_SUBWAY_CATEGORY = "SW8"
+KAKAO_COORD2ADDRESS_URL = "https://dapi.kakao.com/v2/local/geo/coord2address.json"
 
 
 class ApiRequestError(RuntimeError):
@@ -521,6 +524,288 @@ def nearest_subway(address: str, kakao_key: str) -> tuple[str, str]:
     return "", ""
 
 
+def parse_naver_request(raw_input: str) -> tuple[str, dict[str, str]]:
+    text = clean_text(raw_input)
+    if not text:
+        return "", {}
+    if text.startswith("http"):
+        return text, {}
+
+    headers: dict[str, str] = {}
+    url = ""
+    try:
+        parts = shlex.split(text.replace("^\n", " ").replace("`\n", " "))
+    except ValueError:
+        parts = text.split()
+
+    index = 0
+    while index < len(parts):
+        token = parts[index]
+        lower = token.lower()
+        if token.startswith("http"):
+            url = token
+        elif lower in {"-h", "--header"} and index + 1 < len(parts):
+            header = parts[index + 1]
+            if ":" in header:
+                key, value = header.split(":", 1)
+                headers[key.strip()] = value.strip()
+            index += 1
+        elif lower in {"-b", "--cookie", "--cookie-jar"} and index + 1 < len(parts):
+            headers["Cookie"] = parts[index + 1]
+            index += 1
+        index += 1
+    return url, headers
+
+
+def url_with_page(url: str, page: int) -> str:
+    parts = urlsplit(url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query["page"] = str(page)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query, doseq=True), parts.fragment))
+
+
+def naver_source_meta(url: str) -> dict[str, str]:
+    parts = urlsplit(url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    return {
+        "API법정동코드": query.get("cortarNo", ""),
+        "API부동산유형": query.get("realEstateType", ""),
+        "API거래유형": query.get("tradeType", ""),
+        "API페이지": query.get("page", ""),
+    }
+
+
+def fetch_naver_json(url: str, headers: dict[str, str]) -> dict[str, Any]:
+    request_headers = {
+        "accept": "application/json, text/plain, */*",
+        "user-agent": "Mozilla/5.0",
+        "referer": "https://new.land.naver.com/",
+    }
+    request_headers.update({key: value for key, value in headers.items() if value})
+    return request_json(url, {}, request_headers)
+
+
+def naver_read(obj: dict[str, Any], names: list[str]) -> str:
+    return clean_text(readOwn(obj, names))
+
+
+def naver_trade(value: str) -> str:
+    return {"A1": "매매", "B1": "전세", "B2": "월세", "B3": "단기임대"}.get(value, value)
+
+
+def naver_kind(value: str) -> str:
+    return {"SG": "상가", "SMS": "사무실", "GM": "건물", "TJ": "토지", "APT": "아파트", "OPST": "오피스텔"}.get(value, value)
+
+
+def korea_lat_lng(lat: float, lng: float) -> bool:
+    return 32 <= lat <= 39.5 and 124 <= lng <= 132.5
+
+
+def normalize_naver_coordinate(first: Any, second: Any) -> tuple[str, str]:
+    try:
+        a = float(str(first).replace(",", "").strip())
+        b = float(str(second).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return "", ""
+    candidates = [(a, b), (b, a)]
+    scaled = []
+    for x, y in candidates:
+        for div in (1, 10, 100, 1000, 10000, 100000, 1000000, 10000000):
+            scaled.append((x / div, y / div))
+    for lat, lng in scaled:
+        if korea_lat_lng(lat, lng):
+            return f"{lat:.7f}", f"{lng:.7f}"
+    return "", ""
+
+
+def extract_naver_coordinate(obj: dict[str, Any]) -> tuple[str, str, str]:
+    pairs = [
+        (["latitude", "lat", "markerLat", "yLat"], ["longitude", "lng", "lon", "markerLng", "xLng"]),
+        (["ycoordinate", "yCoordinate", "ypos", "yPos", "mapY"], ["xcoordinate", "xCoordinate", "xpos", "xPos", "mapX"]),
+        (["y"], ["x"]),
+    ]
+    for lat_keys, lng_keys in pairs:
+        lat, lng = normalize_naver_coordinate(readOwn(obj, lat_keys), readOwn(obj, lng_keys))
+        if lat and lng:
+            return lat, lng, f"{lat},{lng}"
+
+    geocode = naver_read(obj, ["geocode", "geoCode", "coordinate", "coordinates"])
+    numbers = re.findall(r"\d+(?:\.\d+)?", geocode)
+    if len(numbers) >= 2:
+        lat, lng = normalize_naver_coordinate(numbers[0], numbers[1])
+        if lat and lng:
+            return lat, lng, f"{lat},{lng}"
+    return "", "", geocode
+
+
+def looks_like_naver_article(obj: Any) -> bool:
+    if not isinstance(obj, dict):
+        return False
+    if readOwn(obj, ["articleNo", "atclNo", "articleId"]):
+        return True
+    return bool(re.search(r"atcl|article|rletTp|tradTp|dealOrWarrant|rentPrc|floorInfo", " ".join(obj.keys()), re.I))
+
+
+def walk_objects(value: Any, depth: int = 0) -> list[dict[str, Any]]:
+    if depth > 10:
+        return []
+    found: list[dict[str, Any]] = []
+    if isinstance(value, dict):
+        if looks_like_naver_article(value):
+            found.append(value)
+        for child in value.values():
+            found.extend(walk_objects(child, depth + 1))
+    elif isinstance(value, list):
+        for child in value:
+            found.extend(walk_objects(child, depth + 1))
+    return found
+
+
+def naver_article_row(obj: dict[str, Any], source_url: str) -> dict[str, str]:
+    lat, lng, geocode = extract_naver_coordinate(obj)
+    article_name = naver_read(obj, ["articleName", "atclNm", "name", "title"])
+    feature = naver_read(obj, ["articleFeatureDesc", "atclFetrDesc", "featureDesc", "summary"])
+    meta = naver_source_meta(source_url)
+    row = {
+        "매물번호": naver_read(obj, ["articleNo", "atclNo", "articleId"]),
+        "동": naver_read(obj, ["dongName", "emdNm", "cortarName", "lawdNm", "regionName", "address", "roadAddress"]),
+        "종류": naver_kind(naver_read(obj, ["realEstateTypeName", "rletTpNm", "realEstateTypeCode", "rletTpCd"])),
+        "거래방식": naver_trade(naver_read(obj, ["tradeTypeName", "tradTpNm", "tradeTypeCode", "tradTpCd"])),
+        "보증금": naver_read(obj, ["dealOrWarrantPrc", "warrantPrice", "deposit", "price", "prc"]),
+        "임대료": naver_read(obj, ["rentPrc", "rentPrice", "monthlyRent", "rent"]),
+        "공급면적": naver_read(obj, ["area1", "spc1", "supplyArea"]),
+        "전용/임대면적": naver_read(obj, ["area2", "spc2", "exclusiveArea", "leaseArea"]),
+        "층": naver_read(obj, ["floorInfo", "flrInfo", "floor"]),
+        "방향": naver_read(obj, ["direction", "directionName", "directionBaseTypeName"]),
+        "중개사무소": naver_read(obj, ["realtorName", "realtorOfficeName", "rltrNm", "cpName", "brokerageName"]),
+        "위도": lat,
+        "경도": lng,
+        "geocode": geocode,
+        "매물명": article_name,
+        "요약": feature,
+        "원본API": source_url,
+    }
+    row.update(meta)
+    return row
+
+
+def reverse_geocode_kakao(latitude: str, longitude: str, kakao_key: str) -> dict[str, str]:
+    if not kakao_key or not latitude or not longitude:
+        return {"도로명주소": "", "지번주소": "", "주소변환상태": "좌표 또는 Kakao 키 없음"}
+    data = request_json(
+        KAKAO_COORD2ADDRESS_URL,
+        {"x": longitude, "y": latitude, "input_coord": "WGS84"},
+        {"Authorization": f"KakaoAK {kakao_key}"},
+    )
+    docs = data.get("documents", [])
+    if not docs:
+        return {"도로명주소": "", "지번주소": "", "주소변환상태": "주소 없음"}
+    doc = docs[0]
+    road = doc.get("road_address") or {}
+    jibun = doc.get("address") or {}
+    return {
+        "도로명주소": clean_text(road.get("address_name")),
+        "지번주소": clean_text(jibun.get("address_name")),
+        "주소변환상태": "성공",
+    }
+
+
+def collect_naver_articles(
+    request_text: str,
+    cookie_text: str,
+    start_page: int,
+    end_page: int,
+    kakao_key: str,
+    convert_address: bool,
+) -> pd.DataFrame:
+    url, headers = parse_naver_request(request_text)
+    if not url:
+        raise RuntimeError("네이버 /api/articles URL 또는 cURL을 입력해 주세요.")
+    if cookie_text.strip():
+        headers["Cookie"] = cookie_text.strip()
+
+    rows: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for page in range(start_page, end_page + 1):
+        page_url = url_with_page(url, page)
+        data = fetch_naver_json(page_url, headers)
+        for obj in walk_objects(data):
+            row = naver_article_row(obj, page_url)
+            key = row.get("매물번호") or json.dumps(row, ensure_ascii=False, sort_keys=True)
+            if key in seen:
+                continue
+            seen.add(key)
+            if convert_address:
+                try:
+                    row.update(reverse_geocode_kakao(row.get("위도", ""), row.get("경도", ""), kakao_key))
+                except Exception as exc:
+                    row.update({"도로명주소": "", "지번주소": "", "주소변환상태": f"실패: {exc}"})
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def dataframe_to_xlsx_bytes(df: pd.DataFrame) -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="naver_land")
+    return output.getvalue()
+
+
+def render_naver_land_api_tab(kakao_key: str) -> None:
+    st.subheader("네이버 부동산 API 수집")
+    st.caption("Chrome Network에서 /api/articles 요청 URL 또는 Copy as cURL 내용을 붙여넣으면 매물 좌표와 주소를 엑셀로 저장합니다.")
+
+    request_text = st.text_area(
+        "네이버 /api/articles URL 또는 cURL",
+        height=150,
+        placeholder="https://new.land.naver.com/api/articles?cortarNo=... 또는 curl 'https://new.land.naver.com/api/articles?...' ...",
+    )
+    cookie_text = st.text_area("Cookie 헤더 (필요할 때만)", height=80, placeholder="Network 요청에 Cookie가 필요할 때만 붙여넣기")
+    col1, col2, col3 = st.columns([1, 1, 2])
+    with col1:
+        start_page = st.number_input("시작 페이지", min_value=1, value=1, step=1)
+    with col2:
+        end_page = st.number_input("끝 페이지", min_value=1, value=1, step=1)
+    with col3:
+        convert_address = st.checkbox("위도/경도를 도로명주소로 변환", value=True)
+
+    if convert_address and not kakao_key:
+        st.warning("Kakao REST API 키가 없어 주소 변환은 실패합니다. Secrets 또는 사이드바에 Kakao 키를 넣어주세요.")
+
+    if st.button("네이버 매물 수집", type="primary"):
+        try:
+            with st.spinner("네이버 API 수집 및 주소 변환 중..."):
+                df = collect_naver_articles(
+                    request_text=request_text,
+                    cookie_text=cookie_text,
+                    start_page=int(start_page),
+                    end_page=int(end_page),
+                    kakao_key=kakao_key,
+                    convert_address=convert_address,
+                )
+        except Exception as exc:
+            st.error(str(exc))
+            return
+
+        if df.empty:
+            st.warning("수집된 매물이 없습니다. 현재 Network의 /api/articles URL과 page/cortarNo 값을 확인해 주세요.")
+            return
+
+        st.success(f"{len(df):,}건 수집 완료")
+        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.download_button(
+            "엑셀 다운로드",
+            data=dataframe_to_xlsx_bytes(df),
+            file_name="naver_land_articles.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        st.download_button(
+            "CSV 다운로드",
+            data=df.to_csv(index=False).encode("utf-8-sig"),
+            file_name="naver_land_articles.csv",
+            mime="text/csv",
+        )
+
 def lookup(address: str, juso_key: str, data_key: str, kakao_key: str) -> tuple[JusoResult, BuildingResult, pd.DataFrame]:
     juso = search_juso(address, juso_key)
     if not juso:
@@ -670,122 +955,132 @@ with st.sidebar:
     st.caption("Kakao 키가 없으면 역/도보시간은 비워집니다.")
     debug_mode = st.checkbox("🔧 디버그 표시 (임시)", value=False)
 
-addresses_text = st.text_area(
-    "매물 주소",
-    height=140,
-    placeholder="예: 경기도 수원시 영통구 효원로 400\n여러 건은 줄바꿈으로 입력",
-)
+tab_register, tab_naver = st.tabs(["건축물대장", "네이버 부동산 API 수집"])
 
-with st.expander("집합건물 전유부 조회 옵션"):
-    st.caption("집합건물은 주소만으로 전체 전유부가 여럿 나올 수 있습니다. 특정 호실이면 동명/호명을 입력하세요.")
-    unit_dong = st.text_input("동명 (선택)", placeholder="예: 101동 또는 A동")
-    unit_ho = st.text_input("호명 (선택)", placeholder="예: 301호")
+with tab_register:
+    addresses_text = st.text_area(
+        "매물 주소",
+        height=140,
+        placeholder="예: 경기도 수원시 영통구 효원로 400\n여러 건은 줄바꿈으로 입력",
+    )
 
-run = st.button("조회", type="primary")
+    with st.expander("집합건물 전유부 조회 옵션"):
+        st.caption("집합건물은 주소만으로 전체 전유부가 여럿 나올 수 있습니다. 특정 호실이면 동명/호명을 입력하세요.")
+        unit_dong = st.text_input("동명 (선택)", placeholder="예: 101동 또는 A동")
+        unit_ho = st.text_input("호명 (선택)", placeholder="예: 301호")
 
-if run:
-    addresses = [line.strip() for line in addresses_text.splitlines() if line.strip()]
-    if not juso_key or not data_key:
-        st.error("도로명주소 API 승인키와 공공데이터포털 서비스키를 입력해 주세요.")
-    elif not addresses:
-        st.error("주소를 입력해 주세요.")
-    else:
-        summary_rows: list[dict[str, str]] = []
-        floor_tables: list[pd.DataFrame] = []
-        expos_tables: list[pd.DataFrame] = []
-        pubuse_tables: list[pd.DataFrame] = []
+    run = st.button("조회", type="primary")
 
-        tab_cards, tab_floors, tab_units = st.tabs(["카드 결과", "층별 정보", "집합건물 전유부"])
+    if run:
+        addresses = [line.strip() for line in addresses_text.splitlines() if line.strip()]
+        if not juso_key or not data_key:
+            st.error("도로명주소 API 승인키와 공공데이터포털 서비스키를 입력해 주세요.")
+        elif not addresses:
+            st.error("주소를 입력해 주세요.")
+        else:
+            summary_rows: list[dict[str, str]] = []
+            floor_tables: list[pd.DataFrame] = []
+            expos_tables: list[pd.DataFrame] = []
+            pubuse_tables: list[pd.DataFrame] = []
 
-        with tab_cards:
-            cols = st.columns(3)
+            tab_cards, tab_floors, tab_units = st.tabs(["카드 결과", "층별 정보", "집합건물 전유부"])
 
-        for index, address in enumerate(addresses):
-            try:
-                juso, result, floors_df = lookup(address, juso_key, data_key, kakao_key)
-
-                with tab_cards:
-                    with cols[index % 3]:
-                        render_card(result)
-                    if debug_mode:
-                        render_debug(juso.road_addr, kakao_key)
-
-                summary_rows.append(
-                    {
-                        "입력주소": address,
-                        "건물명": result.name,
-                        "표시주소": result.address,
-                        "가까운역": result.station,
-                        "도보시간": result.walk_time,
-                        "사용승인년도": result.approval_year,
-                        "층수": result.floors,
-                        "연면적": result.total_area_py,
-                    }
-                )
-
-                if not floors_df.empty:
-                    floors_df.insert(0, "입력주소", address)
-                    floor_tables.append(floors_df)
-
-                if unit_dong or unit_ho:
-                    expos_df, pubuse_df = fetch_private_unit(juso, data_key, unit_dong, unit_ho)
-                    if not expos_df.empty:
-                        expos_df.insert(0, "입력주소", address)
-                        expos_tables.append(expos_df)
-                    if not pubuse_df.empty:
-                        pubuse_df.insert(0, "입력주소", address)
-                        pubuse_tables.append(pubuse_df)
-
-            except Exception as exc:
-                st.warning(f"{address}: {exc}")
-
-        if summary_rows:
-            summary_df = pd.DataFrame(summary_rows)
             with tab_cards:
-                st.subheader("표 형식 결과")
-                st.dataframe(summary_df, use_container_width=True, hide_index=True)
-                st.download_button(
-                    "요약 CSV 다운로드",
-                    data=summary_df.to_csv(index=False).encode("utf-8-sig"),
-                    file_name="building_register_summary.csv",
-                    mime="text/csv",
-                )
+                cols = st.columns(3)
 
-        with tab_floors:
-            if floor_tables:
-                floor_df = pd.concat(floor_tables, ignore_index=True)
-                st.dataframe(floor_df, use_container_width=True, hide_index=True)
-                st.download_button(
-                    "층별 정보 CSV 다운로드",
-                    data=floor_df.to_csv(index=False).encode("utf-8-sig"),
-                    file_name="building_floor_outline.csv",
-                    mime="text/csv",
-                )
-            else:
-                st.info("층별 정보가 없습니다.")
+            for index, address in enumerate(addresses):
+                try:
+                    juso, result, floors_df = lookup(address, juso_key, data_key, kakao_key)
 
-        with tab_units:
-            if not (unit_dong or unit_ho):
-                st.info("전유부 조회가 필요하면 동명 또는 호명을 입력하고 다시 조회하세요.")
-            if expos_tables:
-                expos_df = pd.concat(expos_tables, ignore_index=True)
-                st.subheader("전유부")
-                st.dataframe(expos_df, use_container_width=True, hide_index=True)
-                st.download_button(
-                    "전유부 CSV 다운로드",
-                    data=expos_df.to_csv(index=False).encode("utf-8-sig"),
-                    file_name="building_private_unit.csv",
-                    mime="text/csv",
-                )
-            if pubuse_tables:
-                pubuse_df = pd.concat(pubuse_tables, ignore_index=True)
-                st.subheader("전유공용면적")
-                st.dataframe(pubuse_df, use_container_width=True, hide_index=True)
-                st.download_button(
-                    "전유공용면적 CSV 다운로드",
-                    data=pubuse_df.to_csv(index=False).encode("utf-8-sig"),
-                    file_name="building_private_common_area.csv",
-                    mime="text/csv",
-                )
-            if (unit_dong or unit_ho) and not expos_tables and not pubuse_tables:
-                st.info("해당 동/호 전유부 정보가 없거나 조회되지 않았습니다.")
+                    with tab_cards:
+                        with cols[index % 3]:
+                            render_card(result)
+                        if debug_mode:
+                            render_debug(juso.road_addr, kakao_key)
+
+                    summary_rows.append(
+                        {
+                            "입력주소": address,
+                            "건물명": result.name,
+                            "표시주소": result.address,
+                            "가까운역": result.station,
+                            "도보시간": result.walk_time,
+                            "사용승인년도": result.approval_year,
+                            "층수": result.floors,
+                            "연면적": result.total_area_py,
+                        }
+                    )
+
+                    if not floors_df.empty:
+                        floors_df.insert(0, "입력주소", address)
+                        floor_tables.append(floors_df)
+
+                    if unit_dong or unit_ho:
+                        expos_df, pubuse_df = fetch_private_unit(juso, data_key, unit_dong, unit_ho)
+                        if not expos_df.empty:
+                            expos_df.insert(0, "입력주소", address)
+                            expos_tables.append(expos_df)
+                        if not pubuse_df.empty:
+                            pubuse_df.insert(0, "입력주소", address)
+                            pubuse_tables.append(pubuse_df)
+
+                except Exception as exc:
+                    st.warning(f"{address}: {exc}")
+
+            if summary_rows:
+                summary_df = pd.DataFrame(summary_rows)
+                with tab_cards:
+                    st.subheader("표 형식 결과")
+                    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+                    st.download_button(
+                        "요약 CSV 다운로드",
+                        data=summary_df.to_csv(index=False).encode("utf-8-sig"),
+                        file_name="building_register_summary.csv",
+                        mime="text/csv",
+                    )
+
+            with tab_floors:
+                if floor_tables:
+                    floor_df = pd.concat(floor_tables, ignore_index=True)
+                    st.dataframe(floor_df, use_container_width=True, hide_index=True)
+                    st.download_button(
+                        "층별 정보 CSV 다운로드",
+                        data=floor_df.to_csv(index=False).encode("utf-8-sig"),
+                        file_name="building_floor_outline.csv",
+                        mime="text/csv",
+                    )
+                else:
+                    st.info("층별 정보가 없습니다.")
+
+            with tab_units:
+                if not (unit_dong or unit_ho):
+                    st.info("전유부 조회가 필요하면 동명 또는 호명을 입력하고 다시 조회하세요.")
+                if expos_tables:
+                    expos_df = pd.concat(expos_tables, ignore_index=True)
+                    st.subheader("전유부")
+                    st.dataframe(expos_df, use_container_width=True, hide_index=True)
+                    st.download_button(
+                        "전유부 CSV 다운로드",
+                        data=expos_df.to_csv(index=False).encode("utf-8-sig"),
+                        file_name="building_private_unit.csv",
+                        mime="text/csv",
+                    )
+                if pubuse_tables:
+                    pubuse_df = pd.concat(pubuse_tables, ignore_index=True)
+                    st.subheader("전유공용면적")
+                    st.dataframe(pubuse_df, use_container_width=True, hide_index=True)
+                    st.download_button(
+                        "전유공용면적 CSV 다운로드",
+                        data=pubuse_df.to_csv(index=False).encode("utf-8-sig"),
+                        file_name="building_private_common_area.csv",
+                        mime="text/csv",
+                    )
+                if (unit_dong or unit_ho) and not expos_tables and not pubuse_tables:
+                    st.info("해당 동/호 전유부 정보가 없거나 조회되지 않았습니다.")
+
+
+
+
+
+with tab_naver:
+    render_naver_land_api_tab(kakao_key)
