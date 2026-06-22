@@ -423,13 +423,15 @@ def subway_label(subway: tuple[str, int]) -> tuple[str, str]:
 def find_nearest_landmark(
     x: float, y: float, kakao_key: str, subway: tuple[str, int] | None = None
 ) -> tuple[str, str]:
-    """교통시설(지하철/버스터미널) > 관공서 > 공원·랜드마크 순으로 표기 반환.
+    """교통시설 > 관공서 > 백화점 > 대학교 > IC(고속도로 진입로) 순으로 표기 반환.
 
-    지하철역이 당첨이면 ('노선 역이름', '도보 NN분'), 그 외(터미널/시청/공원 등)는
+    지하철역이 당첨이면 ('노선 역이름', '도보 NN분'), 그 외(터미널/시청/백화점 등)는
     ('OO 인근', '') 형태. Kakao 응답의 distance 값으로 반경 내 최근접만 고른다.
     """
 
-    def nearest(path: str, queries: list[dict[str, Any]]) -> tuple[str, int | None]:
+    def nearest(
+        path: str, queries: list[dict[str, Any]], require: tuple[str, ...] | None = None
+    ) -> tuple[str, int | None]:
         best_name, best_dist = "", None
         for extra in queries:
             params = {"x": x, "y": y, "radius": LANDMARK_RADIUS, "sort": "distance", "size": 15}
@@ -441,6 +443,8 @@ def find_nearest_landmark(
                     continue
                 if any(word in name for word in LANDMARK_NAME_EXCLUDE):
                     continue
+                if require and not any(word in name for word in require):
+                    continue
                 if best_dist is None or dist < best_dist:
                     best_name, best_dist = name, dist
         return best_name, best_dist
@@ -449,7 +453,7 @@ def find_nearest_landmark(
     transit: list[tuple[str, str, int]] = []  # (kind, name, dist)
     if subway:
         transit.append(("subway", subway[0], subway[1]))
-    term_name, term_dist = nearest("search/keyword.json", [{"query": "터미널"}])
+    term_name, term_dist = nearest("search/keyword.json", [{"query": "터미널"}], require=("터미널",))
     if term_name and term_dist is not None:
         transit.append(("terminal", term_name, term_dist))
     if transit:
@@ -462,8 +466,18 @@ def find_nearest_landmark(
     name, _ = nearest("search/category.json", [{"category_group_code": "PO3"}])
     if name:
         return f"{name} 인근", ""
-    # 3) 공원·랜드마크(관광명소)
-    name, _ = nearest("search/category.json", [{"category_group_code": "AT4"}])
+    # 3) 백화점
+    name, _ = nearest("search/keyword.json", [{"query": "백화점"}], require=("백화점",))
+    if name:
+        return f"{name} 인근", ""
+    # 4) 대학교
+    name, _ = nearest("search/keyword.json", [{"query": "대학교"}], require=("대학교",))
+    if name:
+        return f"{name} 인근", ""
+    # 5) IC/고속도로 진입로
+    name, _ = nearest(
+        "search/keyword.json", [{"query": "IC"}, {"query": "나들목"}], require=("IC", "JC", "나들목")
+    )
     if name:
         return f"{name} 인근", ""
     return "", ""
@@ -531,11 +545,12 @@ def render_debug(address: str, kakao_key: str) -> None:
         return
     x, y = point
     searches = [
-        ("터미널 (keyword)", "search/keyword.json", {"query": "터미널"}),
-        ("기차역 (keyword)", "search/keyword.json", {"query": "기차역"}),
-        ("공공기관 PO3", "search/category.json", {"category_group_code": "PO3"}),
-        ("관광명소 AT4", "search/category.json", {"category_group_code": "AT4"}),
         ("지하철 SW8", "search/category.json", {"category_group_code": "SW8"}),
+        ("터미널 (keyword)", "search/keyword.json", {"query": "터미널"}),
+        ("공공기관 PO3", "search/category.json", {"category_group_code": "PO3"}),
+        ("백화점 (keyword)", "search/keyword.json", {"query": "백화점"}),
+        ("대학교 (keyword)", "search/keyword.json", {"query": "대학교"}),
+        ("IC (keyword)", "search/keyword.json", {"query": "IC"}),
     ]
     for label, path, extra in searches:
         params = {"x": x, "y": y, "radius": 3000, "sort": "distance", "size": 5}
