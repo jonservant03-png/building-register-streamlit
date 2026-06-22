@@ -430,14 +430,24 @@ def find_nearest_landmark(
     """
 
     def nearest(
-        path: str, queries: list[dict[str, Any]], require: tuple[str, ...] | None = None
+        path: str,
+        queries: list[dict[str, Any]],
+        require: tuple[str, ...] | None = None,
+        require_cat: tuple[str, ...] | None = None,
     ) -> tuple[str, int | None]:
+        """반경 내 최근접 후보 (이름, 거리m).
+
+        require: 장소명에 이 단어 중 하나가 있어야 채택.
+        require_cat: 업종분류(category_name)에 이 단어 중 하나가 있어야 채택.
+          → '브라운도트호텔 군산터미널점'처럼 이름만 터미널인 가짜를 분류로 걸러낸다.
+        """
         best_name, best_dist = "", None
         for extra in queries:
             params = {"x": x, "y": y, "radius": LANDMARK_RADIUS, "sort": "distance", "size": 15}
             params.update(extra)
             for doc in kakao_local_search(path, params, kakao_key):
                 name = clean_text(doc.get("place_name"))
+                category = clean_text(doc.get("category_name"))
                 dist = int(doc.get("distance") or 0)
                 if not dist or dist > LANDMARK_RADIUS:
                     continue
@@ -445,17 +455,22 @@ def find_nearest_landmark(
                     continue
                 if require and not any(word in name for word in require):
                     continue
+                if require_cat and not any(word in category for word in require_cat):
+                    continue
                 if best_dist is None or dist < best_dist:
                     best_name, best_dist = name, dist
         return best_name, best_dist
 
-    # 1) 교통시설: 지하철역 vs 버스터미널 중 최근접 (화물터미널 등 제외)
+    # 1) 교통시설: 지하철역 / 버스터미널 / 기차역 중 최근접 (업종분류로 가짜 제외)
     transit: list[tuple[str, str, int]] = []  # (kind, name, dist)
     if subway:
         transit.append(("subway", subway[0], subway[1]))
-    term_name, term_dist = nearest("search/keyword.json", [{"query": "터미널"}], require=("터미널",))
+    term_name, term_dist = nearest("search/keyword.json", [{"query": "터미널"}], require_cat=("터미널",))
     if term_name and term_dist is not None:
-        transit.append(("terminal", term_name, term_dist))
+        transit.append(("other", term_name, term_dist))
+    train_name, train_dist = nearest("search/keyword.json", [{"query": "기차역"}], require_cat=("기차",))
+    if train_name and train_dist is not None:
+        transit.append(("other", train_name, train_dist))
     if transit:
         kind, name, dist = min(transit, key=lambda t: t[2])
         if kind == "subway":
@@ -467,11 +482,11 @@ def find_nearest_landmark(
     if name:
         return f"{name} 인근", ""
     # 3) 백화점
-    name, _ = nearest("search/keyword.json", [{"query": "백화점"}], require=("백화점",))
+    name, _ = nearest("search/keyword.json", [{"query": "백화점"}], require_cat=("백화점",))
     if name:
         return f"{name} 인근", ""
     # 4) 대학교
-    name, _ = nearest("search/keyword.json", [{"query": "대학교"}], require=("대학교",))
+    name, _ = nearest("search/keyword.json", [{"query": "대학교"}], require_cat=("대학교",))
     if name:
         return f"{name} 인근", ""
     # 5) IC/고속도로 진입로
@@ -547,6 +562,7 @@ def render_debug(address: str, kakao_key: str) -> None:
     searches = [
         ("지하철 SW8", "search/category.json", {"category_group_code": "SW8"}),
         ("터미널 (keyword)", "search/keyword.json", {"query": "터미널"}),
+        ("기차역 (keyword)", "search/keyword.json", {"query": "기차역"}),
         ("공공기관 PO3", "search/category.json", {"category_group_code": "PO3"}),
         ("백화점 (keyword)", "search/keyword.json", {"query": "백화점"}),
         ("대학교 (keyword)", "search/keyword.json", {"query": "대학교"}),
@@ -558,7 +574,11 @@ def render_debug(address: str, kakao_key: str) -> None:
         try:
             docs = kakao_local_search(path, params, kakao_key)
             rows = [
-                {"place_name": d.get("place_name"), "distance": d.get("distance")}
+                {
+                    "place_name": d.get("place_name"),
+                    "distance": d.get("distance"),
+                    "category": d.get("category_name"),
+                }
                 for d in docs
             ]
             st.write(f"[{label}] ({len(rows)}건)", rows or "결과 없음")
