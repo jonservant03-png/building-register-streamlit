@@ -859,8 +859,41 @@ def enrich_pasted_listings_with_address(text: str, kakao_key: str, juso_key: str
                 record.update(summary)
         records.append(record)
 
-    return pd.DataFrame(records)
+    return add_duplicate_tags(pd.DataFrame(records))
 
+
+def normalize_duplicate_floor(value: Any) -> str:
+    text = clean_text(value)
+    if not text:
+        return ""
+    return re.sub(r"\s+", "", text)
+
+
+def add_duplicate_tags(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    result = df.copy()
+    floor_col = find_column(result, ["사용층", "층", "floor", "usefloor"])
+    if not floor_col:
+        result["중복태그"] = ""
+        return result
+
+    seen: set[tuple[str, str]] = set()
+    tags: list[str] = []
+    for _, row in result.iterrows():
+        geocode = clean_text(row.get("geocode"))
+        floor = normalize_duplicate_floor(row.get(floor_col))
+        if not geocode or not floor:
+            tags.append("")
+            continue
+        key = (geocode, floor)
+        if key in seen:
+            tags.append("중복")
+        else:
+            seen.add(key)
+            tags.append("")
+    result["중복태그"] = tags
+    return result
 
 def dataframe_to_xlsx_bytes(df: pd.DataFrame) -> bytes:
     output = io.BytesIO()
