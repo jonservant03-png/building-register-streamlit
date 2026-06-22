@@ -874,19 +874,23 @@ def add_duplicate_tags(df: pd.DataFrame) -> pd.DataFrame:
         return df
     result = df.copy()
     floor_col = find_column(result, ["사용층", "층", "floor", "usefloor"])
-    if not floor_col:
+    road_col = find_column(result, ["도로명주소", "road_address", "roadaddr"])
+    jibun_col = find_column(result, ["지번주소", "jibun_address", "jibunaddr"])
+    if not floor_col or not (road_col or jibun_col):
         result["중복태그"] = ""
         return result
 
     seen: set[tuple[str, str]] = set()
     tags: list[str] = []
     for _, row in result.iterrows():
-        geocode = clean_text(row.get("geocode"))
+        address = clean_text(row.get(road_col)) if road_col else ""
+        if not address and jibun_col:
+            address = clean_text(row.get(jibun_col))
         floor = normalize_duplicate_floor(row.get(floor_col))
-        if not geocode or not floor:
+        if not address or not floor:
             tags.append("")
             continue
-        key = (geocode, floor)
+        key = (re.sub(r"\s+", "", address), floor)
         if key in seen:
             tags.append("중복")
         else:
