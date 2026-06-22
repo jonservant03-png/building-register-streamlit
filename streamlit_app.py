@@ -792,7 +792,29 @@ def coordinate_from_row(row: pd.Series, lat_col: str, lng_col: str, geocode_col:
     return "", "", geocode
 
 
-def enrich_pasted_listings_with_address(text: str, kakao_key: str) -> pd.DataFrame:
+def building_summary_from_address(address: str, juso_key: str, data_key: str) -> dict[str, str]:
+    if not address:
+        return {"연면적": "", "층수": "", "준공연도": "", "건축물조회상태": "주소 없음"}
+    if not juso_key or not data_key:
+        return {"연면적": "", "층수": "", "준공연도": "", "건축물조회상태": "API 키 없음"}
+
+    try:
+        juso = search_juso(address, juso_key)
+        if not juso:
+            return {"연면적": "", "층수": "", "준공연도": "", "건축물조회상태": "주소 검색 실패"}
+        building = fetch_building_title(juso, data_key)
+        if not building:
+            return {"연면적": "", "층수": "", "준공연도": "", "건축물조회상태": "표제부 없음"}
+        return {
+            "연면적": format_py(building.get("totArea")),
+            "층수": format_floors(building.get("grndFlrCnt"), building.get("ugrndFlrCnt")),
+            "준공연도": format_year(clean_text(building.get("useAprDay"))),
+            "건축물조회상태": "성공",
+        }
+    except Exception as exc:
+        return {"연면적": "", "층수": "", "준공연도": "", "건축물조회상태": f"실패: {exc}"}
+
+def enrich_pasted_listings_with_address(text: str, kakao_key: str, juso_key: str = "", data_key: str = "", include_building: bool = True) -> pd.DataFrame:
     df = parse_pasted_listing_table(text)
     if df.empty:
         return df
@@ -805,6 +827,7 @@ def enrich_pasted_listings_with_address(text: str, kakao_key: str) -> pd.DataFra
         raise RuntimeError("위도/경도 또는 geocode 열을 찾지 못했습니다. 콘솔 복사 결과에 좌표 열이 포함되어야 합니다.")
 
     cache: dict[tuple[str, str], dict[str, str]] = {}
+    building_cache: dict[str, dict[str, str]] = {}
     records: list[dict[str, Any]] = []
     for _, row in df.iterrows():
         record = row.to_dict()
@@ -825,9 +848,18 @@ def enrich_pasted_listings_with_address(text: str, kakao_key: str) -> pd.DataFra
                 converted = {"도로명주소": "", "지번주소": "", "주소변환상태": f"실패: {exc}"}
             cache[key] = converted
             record.update(converted)
+        if include_building:
+            lookup_address = clean_text(record.get("도로명주소")) or clean_text(record.get("지번주소"))
+            if lookup_address in building_cache:
+                record.update(building_cache[lookup_address])
+            else:
+                summary = building_summary_from_address(lookup_address, juso_key, data_key)
+                building_cache[lookup_address] = summary
+                record.update(summary)
         records.append(record)
 
     return pd.DataFrame(records)
+
 
 def dataframe_to_xlsx_bytes(df: pd.DataFrame) -> bytes:
     output = io.BytesIO()
@@ -836,7 +868,7 @@ def dataframe_to_xlsx_bytes(df: pd.DataFrame) -> bytes:
     return output.getvalue()
 
 
-def render_naver_land_api_tab(kakao_key: str) -> None:
+def render_naver_land_api_tab(kakao_key: str, juso_key: str, data_key: str) -> None:
     st.subheader("네이버 부동산 매물 주소 변환")
     st.caption("크롬 콘솔에서 엑셀 복사된 매물 표를 붙여넣으면 위도/경도를 도로명주소로 변환해 엑셀 파일로 저장합니다.")
 
@@ -846,9 +878,12 @@ def render_naver_land_api_tab(kakao_key: str) -> None:
         placeholder="No\t매물번호\t...\tgeocode\t위도\t경도\n1\t...",
     )
     st.caption("헤더 행이 포함된 TSV/CSV를 붙여넣어 주세요. 열 이름은 `위도`/`경도` 또는 `geocode`를 인식합니다.")
+    include_building = st.checkbox("도로명주소로 연면적/층수/준공연도 조회", value=True)
 
     if not kakao_key:
         st.warning("Kakao REST API 키가 없어 도로명주소 변환을 할 수 없습니다. Secrets 또는 사이드바에 Kakao 키를 넣어주세요.")
+    if include_building and (not juso_key or not data_key):
+        st.warning("연면적/층수/준공연도 조회에는 도로명주소 API 키와 공공데이터포털 키가 필요합니다.")
 
     if st.button("붙여넣은 매물 주소 변환", type="primary"):
         if not kakao_key:
@@ -856,7 +891,7 @@ def render_naver_land_api_tab(kakao_key: str) -> None:
             return
         try:
             with st.spinner("좌표를 도로명주소로 변환 중..."):
-                df = enrich_pasted_listings_with_address(pasted_text, kakao_key)
+                df = enrich_pasted_listings_with_address(pasted_text, kakao_key, juso_key, data_key, include_building)
         except Exception as exc:
             st.error(str(exc))
             return
@@ -866,7 +901,8 @@ def render_naver_land_api_tab(kakao_key: str) -> None:
             return
 
         success_count = int((df.get("주소변환상태", pd.Series(dtype=str)) == "성공").sum())
-        st.success(f"{len(df):,}건 처리 완료 · 주소 변환 성공 {success_count:,}건")
+        building_count = int((df.get("건축물조회상태", pd.Series(dtype=str)) == "성공").sum())
+        st.success(f"{len(df):,}건 처리 완료 · 주소 변환 성공 {success_count:,}건 · 건축물 조회 성공 {building_count:,}건")
         st.dataframe(df, use_container_width=True, hide_index=True)
         st.download_button(
             "주소 변환 엑셀 다운로드",
@@ -1206,4 +1242,4 @@ with tab_register:
 
 
 with tab_naver:
-    render_naver_land_api_tab(kakao_key)
+    render_naver_land_api_tab(kakao_key, juso_key, data_key)
