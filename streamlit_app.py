@@ -794,25 +794,26 @@ def coordinate_from_row(row: pd.Series, lat_col: str, lng_col: str, geocode_col:
 
 def building_summary_from_address(address: str, juso_key: str, data_key: str) -> dict[str, str]:
     if not address:
-        return {"연면적": "", "층수": "", "준공연도": "", "건축물조회상태": "주소 없음"}
+        return {"건물명": "", "연면적": "", "층수": "", "준공연도": "", "건축물조회상태": "주소 없음"}
     if not juso_key or not data_key:
-        return {"연면적": "", "층수": "", "준공연도": "", "건축물조회상태": "API 키 없음"}
+        return {"건물명": "", "연면적": "", "층수": "", "준공연도": "", "건축물조회상태": "API 키 없음"}
 
     try:
         juso = search_juso(address, juso_key)
         if not juso:
-            return {"연면적": "", "층수": "", "준공연도": "", "건축물조회상태": "주소 검색 실패"}
+            return {"건물명": "", "연면적": "", "층수": "", "준공연도": "", "건축물조회상태": "주소 검색 실패"}
         building = fetch_building_title(juso, data_key)
         if not building:
-            return {"연면적": "", "층수": "", "준공연도": "", "건축물조회상태": "표제부 없음"}
+            return {"건물명": "", "연면적": "", "층수": "", "준공연도": "", "건축물조회상태": "표제부 없음"}
         return {
+            "건물명": clean_text(building.get("bldNm")) or "건물명 없음",
             "연면적": format_py(building.get("totArea")),
             "층수": format_floors(building.get("grndFlrCnt"), building.get("ugrndFlrCnt")),
             "준공연도": format_year(clean_text(building.get("useAprDay"))),
             "건축물조회상태": "성공",
         }
     except Exception as exc:
-        return {"연면적": "", "층수": "", "준공연도": "", "건축물조회상태": f"실패: {exc}"}
+        return {"건물명": "", "연면적": "", "층수": "", "준공연도": "", "건축물조회상태": f"실패: {exc}"}
 
 def enrich_pasted_listings_with_address(text: str, kakao_key: str, juso_key: str = "", data_key: str = "", include_building: bool = True) -> pd.DataFrame:
     df = parse_pasted_listing_table(text)
@@ -878,12 +879,12 @@ def render_naver_land_api_tab(kakao_key: str, juso_key: str, data_key: str) -> N
         placeholder="No\t매물번호\t...\tgeocode\t위도\t경도\n1\t...",
     )
     st.caption("헤더 행이 포함된 TSV/CSV를 붙여넣어 주세요. 열 이름은 `위도`/`경도` 또는 `geocode`를 인식합니다.")
-    include_building = st.checkbox("도로명주소로 연면적/층수/준공연도 조회", value=True)
+    include_building = st.checkbox("도로명주소로 건물명/연면적/층수/준공연도 조회", value=True)
 
     if not kakao_key:
         st.warning("Kakao REST API 키가 없어 도로명주소 변환을 할 수 없습니다. Secrets 또는 사이드바에 Kakao 키를 넣어주세요.")
     if include_building and (not juso_key or not data_key):
-        st.warning("연면적/층수/준공연도 조회에는 도로명주소 API 키와 공공데이터포털 키가 필요합니다.")
+        st.warning("건물명/연면적/층수/준공연도 조회에는 도로명주소 API 키와 공공데이터포털 키가 필요합니다.")
 
     if st.button("붙여넣은 매물 주소 변환", type="primary"):
         if not kakao_key:
