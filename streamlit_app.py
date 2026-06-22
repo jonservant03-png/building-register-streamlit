@@ -744,6 +744,91 @@ def collect_naver_articles(
     return pd.DataFrame(rows)
 
 
+def find_column(df: pd.DataFrame, candidates: list[str]) -> str:
+    normalized = {re.sub(r"\s+", "", str(col)).lower(): col for col in df.columns}
+    for candidate in candidates:
+        key = re.sub(r"\s+", "", candidate).lower()
+        if key in normalized:
+            return normalized[key]
+    for key, col in normalized.items():
+        if any(re.sub(r"\s+", "", candidate).lower() in key for candidate in candidates):
+            return col
+    return ""
+
+
+def parse_pasted_listing_table(text: str) -> pd.DataFrame:
+    raw = text.strip("\ufeff\n\r\t ")
+    if not raw:
+        return pd.DataFrame()
+
+    for separator in ("\t", ","):
+        try:
+            df = pd.read_csv(io.StringIO(raw), sep=separator, dtype=str).fillna("")
+        except Exception:
+            continue
+        if len(df.columns) > 1:
+            df.columns = [clean_text(col) for col in df.columns]
+            return df
+
+    lines = [line for line in raw.splitlines() if line.strip()]
+    rows = [re.split(r"\s{2,}|\t", line.strip()) for line in lines]
+    if len(rows) >= 2 and len(rows[0]) > 1:
+        return pd.DataFrame(rows[1:], columns=[clean_text(col) for col in rows[0]]).fillna("")
+    raise RuntimeError("표를 읽지 못했습니다. 엑셀/콘솔에서 헤더 포함 TSV 형식으로 복사해 붙여넣어 주세요.")
+
+
+def coordinate_from_row(row: pd.Series, lat_col: str, lng_col: str, geocode_col: str) -> tuple[str, str, str]:
+    if lat_col and lng_col:
+        lat, lng = normalize_naver_coordinate(row.get(lat_col, ""), row.get(lng_col, ""))
+        if lat and lng:
+            return lat, lng, f"{lat},{lng}"
+
+    geocode = clean_text(row.get(geocode_col, "")) if geocode_col else ""
+    numbers = re.findall(r"\d+(?:\.\d+)?", geocode)
+    if len(numbers) >= 2:
+        lat, lng = normalize_naver_coordinate(numbers[0], numbers[1])
+        if lat and lng:
+            return lat, lng, f"{lat},{lng}"
+    return "", "", geocode
+
+
+def enrich_pasted_listings_with_address(text: str, kakao_key: str) -> pd.DataFrame:
+    df = parse_pasted_listing_table(text)
+    if df.empty:
+        return df
+
+    lat_col = find_column(df, ["위도", "latitude", "lat", "y"])
+    lng_col = find_column(df, ["경도", "longitude", "lng", "lon", "x"])
+    geocode_col = find_column(df, ["geocode", "geo", "좌표", "coordinate"])
+
+    if not ((lat_col and lng_col) or geocode_col):
+        raise RuntimeError("위도/경도 또는 geocode 열을 찾지 못했습니다. 콘솔 복사 결과에 좌표 열이 포함되어야 합니다.")
+
+    cache: dict[tuple[str, str], dict[str, str]] = {}
+    records: list[dict[str, Any]] = []
+    for _, row in df.iterrows():
+        record = row.to_dict()
+        lat, lng, geocode = coordinate_from_row(row, lat_col, lng_col, geocode_col)
+        record["위도"] = lat
+        record["경도"] = lng
+        record["geocode"] = geocode
+
+        key = (lat, lng)
+        if not lat or not lng:
+            record.update({"도로명주소": "", "지번주소": "", "주소변환상태": "좌표 없음"})
+        elif key in cache:
+            record.update(cache[key])
+        else:
+            try:
+                converted = reverse_geocode_kakao(lat, lng, kakao_key)
+            except Exception as exc:
+                converted = {"도로명주소": "", "지번주소": "", "주소변환상태": f"실패: {exc}"}
+            cache[key] = converted
+            record.update(converted)
+        records.append(record)
+
+    return pd.DataFrame(records)
+
 def dataframe_to_xlsx_bytes(df: pd.DataFrame) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -752,59 +837,97 @@ def dataframe_to_xlsx_bytes(df: pd.DataFrame) -> bytes:
 
 
 def render_naver_land_api_tab(kakao_key: str) -> None:
-    st.subheader("네이버 부동산 API 수집")
-    st.caption("Chrome Network에서 /api/articles 요청 URL 또는 Copy as cURL 내용을 붙여넣으면 매물 좌표와 주소를 엑셀로 저장합니다.")
+    st.subheader("네이버 부동산 매물 주소 변환")
+    st.caption("크롬 콘솔에서 엑셀 복사된 매물 표를 붙여넣으면 위도/경도를 도로명주소로 변환해 엑셀 파일로 저장합니다.")
 
-    request_text = st.text_area(
-        "네이버 /api/articles URL 또는 cURL",
-        height=150,
-        placeholder="https://new.land.naver.com/api/articles?cortarNo=... 또는 curl 'https://new.land.naver.com/api/articles?...' ...",
+    pasted_text = st.text_area(
+        "콘솔/엑셀 복사 결과 붙여넣기",
+        height=260,
+        placeholder="No\t매물번호\t...\tgeocode\t위도\t경도\n1\t...",
     )
-    cookie_text = st.text_area("Cookie 헤더 (필요할 때만)", height=80, placeholder="Network 요청에 Cookie가 필요할 때만 붙여넣기")
-    col1, col2, col3 = st.columns([1, 1, 2])
-    with col1:
-        start_page = st.number_input("시작 페이지", min_value=1, value=1, step=1)
-    with col2:
-        end_page = st.number_input("끝 페이지", min_value=1, value=1, step=1)
-    with col3:
-        convert_address = st.checkbox("위도/경도를 도로명주소로 변환", value=True)
+    st.caption("헤더 행이 포함된 TSV/CSV를 붙여넣어 주세요. 열 이름은 `위도`/`경도` 또는 `geocode`를 인식합니다.")
 
-    if convert_address and not kakao_key:
-        st.warning("Kakao REST API 키가 없어 주소 변환은 실패합니다. Secrets 또는 사이드바에 Kakao 키를 넣어주세요.")
+    if not kakao_key:
+        st.warning("Kakao REST API 키가 없어 도로명주소 변환을 할 수 없습니다. Secrets 또는 사이드바에 Kakao 키를 넣어주세요.")
 
-    if st.button("네이버 매물 수집", type="primary"):
+    if st.button("붙여넣은 매물 주소 변환", type="primary"):
+        if not kakao_key:
+            st.error("Kakao REST API 키를 먼저 입력해 주세요.")
+            return
         try:
-            with st.spinner("네이버 API 수집 및 주소 변환 중..."):
-                df = collect_naver_articles(
-                    request_text=request_text,
-                    cookie_text=cookie_text,
-                    start_page=int(start_page),
-                    end_page=int(end_page),
-                    kakao_key=kakao_key,
-                    convert_address=convert_address,
-                )
+            with st.spinner("좌표를 도로명주소로 변환 중..."):
+                df = enrich_pasted_listings_with_address(pasted_text, kakao_key)
         except Exception as exc:
             st.error(str(exc))
             return
 
         if df.empty:
-            st.warning("수집된 매물이 없습니다. 현재 Network의 /api/articles URL과 page/cortarNo 값을 확인해 주세요.")
+            st.warning("변환할 데이터가 없습니다.")
             return
 
-        st.success(f"{len(df):,}건 수집 완료")
+        success_count = int((df.get("주소변환상태", pd.Series(dtype=str)) == "성공").sum())
+        st.success(f"{len(df):,}건 처리 완료 · 주소 변환 성공 {success_count:,}건")
         st.dataframe(df, use_container_width=True, hide_index=True)
         st.download_button(
-            "엑셀 다운로드",
+            "주소 변환 엑셀 다운로드",
             data=dataframe_to_xlsx_bytes(df),
-            file_name="naver_land_articles.xlsx",
+            file_name="naver_land_articles_with_address.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
         st.download_button(
-            "CSV 다운로드",
+            "주소 변환 CSV 다운로드",
             data=df.to_csv(index=False).encode("utf-8-sig"),
-            file_name="naver_land_articles.csv",
+            file_name="naver_land_articles_with_address.csv",
             mime="text/csv",
         )
+
+    with st.expander("실험 기능: 네이버 API URL 직접 수집"):
+        st.caption("네이버 서버 응답이 느리거나 차단될 수 있어 기본 흐름은 콘솔 복사 결과 붙여넣기입니다.")
+        request_text = st.text_area(
+            "네이버 /api/articles URL 또는 cURL",
+            height=120,
+            placeholder="https://new.land.naver.com/api/articles?cortarNo=... 또는 curl 'https://new.land.naver.com/api/articles?...' ...",
+            key="naver_api_request_text",
+        )
+        cookie_text = st.text_area(
+            "Cookie 헤더 (필요할 때만)",
+            height=70,
+            placeholder="Network 요청에 Cookie가 필요할 때만 붙여넣기",
+            key="naver_api_cookie_text",
+        )
+        col1, col2 = st.columns(2)
+        with col1:
+            start_page = st.number_input("시작 페이지", min_value=1, value=1, step=1, key="naver_api_start_page")
+        with col2:
+            end_page = st.number_input("끝 페이지", min_value=1, value=1, step=1, key="naver_api_end_page")
+
+        if st.button("API URL 직접 수집", key="naver_api_collect"):
+            try:
+                with st.spinner("네이버 API 수집 및 주소 변환 중..."):
+                    df = collect_naver_articles(
+                        request_text=request_text,
+                        cookie_text=cookie_text,
+                        start_page=int(start_page),
+                        end_page=int(end_page),
+                        kakao_key=kakao_key,
+                        convert_address=bool(kakao_key),
+                    )
+            except Exception as exc:
+                st.error(str(exc))
+                return
+
+            if df.empty:
+                st.warning("수집된 매물이 없습니다. Network의 /api/articles URL과 page/cortarNo 값을 확인해 주세요.")
+                return
+
+            st.success(f"{len(df):,}건 수집 완료")
+            st.dataframe(df, use_container_width=True, hide_index=True)
+            st.download_button(
+                "API 수집 엑셀 다운로드",
+                data=dataframe_to_xlsx_bytes(df),
+                file_name="naver_land_articles.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
 
 def lookup(address: str, juso_key: str, data_key: str, kakao_key: str) -> tuple[JusoResult, BuildingResult, pd.DataFrame]:
     juso = search_juso(address, juso_key)
