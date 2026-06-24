@@ -41,6 +41,7 @@ class BuildingResult:
     floors: str
     total_area_py: str
     owner_summary: str = ""
+    collective_building: str = ""
     station: str = ""
     walk_time: str = ""
 
@@ -376,6 +377,13 @@ def format_owner_summary(owner_df: pd.DataFrame, empty_text: str = "소유주 �
     if len(names) <= limit:
         return "소유주 " + ", ".join(names)
     return f"소유주 {', '.join(names[:limit])} 외 {len(names) - limit}명"
+
+
+def format_collective_building(building: dict[str, Any]) -> str:
+    register_type = clean_text(building.get("regstrGbCdNm"))
+    if not register_type:
+        return ""
+    return "예" if "집합" in register_type else "아니오"
 
 
 def add_owner_summary_to_units(expos_df: pd.DataFrame, owner_df: pd.DataFrame) -> pd.DataFrame:
@@ -1152,6 +1160,7 @@ def lookup(
         floors=format_floors(building.get("grndFlrCnt"), building.get("ugrndFlrCnt")),
         total_area_py=format_py(building.get("totArea")),
         owner_summary=owner_summary,
+        collective_building=format_collective_building(building),
         station=station,
         walk_time=walk_time,
     )
@@ -1351,6 +1360,7 @@ with tab_register:
                             "층수": result.floors,
                             "연면적": result.total_area_py,
                             "소유주": result.owner_summary,
+                            "집합건물여부": result.collective_building,
                         }
                     )
 
