@@ -13,7 +13,6 @@ import streamlit as st
 
 PY_PER_SQM = 1 / 3.305785
 BUILDING_API_BASE = "https://apis.data.go.kr/1613000/BldRgstHubService"
-OWNER_API_ENDPOINTS = ["getBrOwnrInfo", "getBrOwnInfo", "getBrOwnerInfo"]
 JUSO_API_URL = "https://business.juso.go.kr/addrlink/addrLinkApi.do"
 KAKAO_SUBWAY_CATEGORY = "SW8"
 KAKAO_COORD2ADDRESS_URL = "https://dapi.kakao.com/v2/local/geo/coord2address.json"
@@ -41,7 +40,6 @@ class BuildingResult:
     approval_year: str
     floors: str
     total_area_py: str
-    owner_summary: str = ""
     collective_building: str = ""
     station: str = ""
     walk_time: str = ""
@@ -185,12 +183,6 @@ def normalize_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return item if isinstance(item, list) else []
 
 
-def response_total_count(payload: dict[str, Any]) -> int:
-    try:
-        return int(payload.get("response", {}).get("body", {}).get("totalCount") or 0)
-    except (TypeError, ValueError):
-        return 0
-
 
 def ensure_success_response(payload: dict[str, Any]) -> None:
     header = payload.get("response", {}).get("header", {})
@@ -293,42 +285,6 @@ def fetch_building_api_with_extra(
     raise ApiRequestError("건축물대장 API 호출이 모두 실패했습니다. " + " / ".join(errors))
 
 
-def fetch_building_api_all_pages_with_extra(
-    endpoint: str,
-    juso: JusoResult,
-    data_key: str,
-    rows: int = 100,
-    extra_params: dict[str, Any] | None = None,
-    max_pages: int = 30,
-) -> list[dict[str, Any]]:
-    errors: list[str] = []
-    per_page = min(max(int(rows or 100), 1), 100)
-    for index, service_key in enumerate(data_key_candidates(data_key), start=1):
-        try:
-            first_params = building_params(juso, service_key, rows=per_page)
-            if extra_params:
-                first_params.update(extra_params)
-            first_params["pageNo"] = 1
-            first = request_json(f"{BUILDING_API_BASE}/{endpoint}", first_params)
-            ensure_success_response(first)
-            items = normalize_items(first)
-            total = response_total_count(first)
-            total_pages = min(max((total + per_page - 1) // per_page, 1), max_pages)
-
-            for page_no in range(2, total_pages + 1):
-                params = building_params(juso, service_key, rows=per_page)
-                if extra_params:
-                    params.update(extra_params)
-                params["pageNo"] = page_no
-                data = request_json(f"{BUILDING_API_BASE}/{endpoint}", params)
-                ensure_success_response(data)
-                items.extend(normalize_items(data))
-            return items
-        except ApiRequestError as exc:
-            errors.append(f"{index}차 시도 실패: {exc}")
-            continue
-    raise ApiRequestError("건축물대장 API 호출이 모두 실패했습니다. " + " / ".join(errors))
-
 
 def fetch_building_title(juso: JusoResult, data_key: str) -> dict[str, Any] | None:
     items = fetch_building_api("getBrTitleInfo", juso, data_key, rows=30)
@@ -399,149 +355,6 @@ def is_private_area_row(row: dict[str, Any]) -> bool:
     return gb_code == "1" or gb_name == "전유"
 
 
-def owner_name_from_row(row: dict[str, Any] | pd.Series) -> str:
-    return first_clean(
-        row,
-        [
-            "성명(명칭)",
-            "성명",
-            "명칭",
-            "소유자명",
-            "소유주명",
-            "ownrNm",
-            "ownrName",
-            "ownerNm",
-            "ownerName",
-            "userNm",
-            "name",
-        ],
-    )
-
-
-def owner_share_from_row(row: dict[str, Any] | pd.Series) -> str:
-    return first_clean(
-        row,
-        [
-            "소유권 지분",
-            "소유권지분",
-            "지분",
-            "소유지분",
-            "ownrCpb",
-            "ownCpb",
-            "ownerShare",
-            "share",
-        ],
-    )
-
-
-def owner_records(rows: list[dict[str, Any]]) -> list[dict[str, str]]:
-    records = []
-    for row in rows:
-        records.append(
-            {
-                "동명": first_clean(row, ["dongNm", "동명"]),
-                "호명": first_clean(row, ["hoNm", "호명"]),
-                "관리대장PK": first_clean(row, ["mgmBldrgstPk", "관리대장PK"]),
-                "성명(명칭)": owner_name_from_row(row),
-                "소유주": owner_name_from_row(row),
-                "소유구분": first_clean(row, ["ownrGbCdNm", "소유구분", "소유자구분"]),
-                "소유권 지분": owner_share_from_row(row),
-                "지분": owner_share_from_row(row),
-                "공유자수": first_clean(row, ["cnrsPsnCo", "공유자수"]),
-                "변동일": first_clean(row, ["changDt", "변동일"]),
-            }
-        )
-    return records
-
-
-def fetch_owner_rows(juso: JusoResult, data_key: str, extra_params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-    errors = []
-    for endpoint in OWNER_API_ENDPOINTS:
-        try:
-            rows = fetch_building_api_all_pages_with_extra(endpoint, juso, data_key, rows=100, extra_params=extra_params)
-            if rows:
-                return rows
-        except ApiRequestError as exc:
-            errors.append(f"{endpoint}: {exc}")
-    return []
-
-
-def fetch_owner_info(juso: JusoResult, data_key: str) -> pd.DataFrame:
-    rows = fetch_owner_rows(juso, data_key)
-    return pd.DataFrame(owner_records(rows))
-
-
-def fetch_unit_owner_info(juso: JusoResult, data_key: str, dong_nm: str, ho_nm: str) -> pd.DataFrame:
-    extra_params = {}
-    if dong_nm:
-        extra_params["dongNm"] = dong_nm
-    if ho_nm:
-        extra_params["hoNm"] = ho_nm
-    rows = fetch_owner_rows(juso, data_key, extra_params=extra_params)
-    if dong_nm or ho_nm:
-        filtered_rows = filter_by_dong_ho(rows, dong_nm, ho_nm)
-        if filtered_rows:
-            rows = filtered_rows
-    return pd.DataFrame(owner_records(rows))
-
-
-def filter_owner_df(owner_df: pd.DataFrame, dong_nm: str, ho_nm: str, mgm_bldrgst_pk: str = "") -> pd.DataFrame:
-    if owner_df.empty:
-        return owner_df
-
-    pk = clean_text(mgm_bldrgst_pk)
-    if pk and "관리대장PK" in owner_df.columns:
-        by_pk = owner_df[owner_df["관리대장PK"].map(clean_text) == pk]
-        if not by_pk.empty:
-            return by_pk
-
-    result = owner_df
-    dong = unit_key(dong_nm, "동")
-    ho = unit_key(ho_nm, "호")
-    if dong and "동명" in result.columns:
-        exact = result[result["동명"].map(lambda value: unit_key(value, "동") == dong)]
-        relaxed = result[result["동명"].map(lambda value: dong in unit_key(value, "동"))]
-        result = exact if not exact.empty else relaxed if not relaxed.empty else result
-    if ho and "호명" in result.columns:
-        exact = result[result["호명"].map(lambda value: unit_key(value, "호") == ho)]
-        relaxed = result[result["호명"].map(lambda value: ho in unit_key(value, "호"))]
-        result = exact if not exact.empty else relaxed if not relaxed.empty else result
-    return result
-
-
-def owner_display_columns(owner_df: pd.DataFrame) -> tuple[str, str]:
-    if owner_df.empty:
-        return "", ""
-
-    name_col = "성명(명칭)" if "성명(명칭)" in owner_df.columns else "소유주" if "소유주" in owner_df.columns else ""
-    share_col = "소유권 지분" if "소유권 지분" in owner_df.columns else "지분" if "지분" in owner_df.columns else ""
-
-    names = []
-    if name_col:
-        names = [name for name in owner_df[name_col].dropna().map(clean_text).drop_duplicates().tolist() if name]
-    shares = []
-    if share_col:
-        shares = [share for share in owner_df[share_col].dropna().map(clean_text).drop_duplicates().tolist() if share]
-    return ", ".join(names), ", ".join(shares)
-
-
-def format_owner_summary(owner_df: pd.DataFrame, empty_text: str = "소유주 정보 없음", limit: int = 2) -> str:
-    if owner_df.empty:
-        return empty_text
-
-    display_names, _ = owner_display_columns(owner_df)
-    names = [name.strip() for name in display_names.split(",") if name.strip()]
-    if names and len(names) <= limit:
-        return "소유주 " + ", ".join(names)
-    if names:
-        return f"소유주 {', '.join(names[:limit])} 외 {len(names) - limit}명"
-
-    owner_types = []
-    if "소유구분" in owner_df.columns:
-        owner_types = [value for value in owner_df["소유구분"].dropna().map(clean_text).drop_duplicates().tolist() if value]
-    type_text = f"({', '.join(owner_types[:2])})" if owner_types else ""
-    return f"소유자명 미제공 {len(owner_df):,}명{type_text}" if len(owner_df) else empty_text
-
 
 def format_collective_building(building: dict[str, Any]) -> str:
     register_type = clean_text(building.get("regstrGbCdNm"))
@@ -549,46 +362,6 @@ def format_collective_building(building: dict[str, Any]) -> str:
         return ""
     return "예" if "집합" in register_type else "아니오"
 
-
-def add_owner_summary_to_units(
-    expos_df: pd.DataFrame, owner_df: pd.DataFrame, juso: JusoResult | None = None, data_key: str = ""
-) -> pd.DataFrame:
-    if expos_df.empty:
-        return expos_df
-
-    result = expos_df.copy()
-    owner_names = []
-    owner_shares = []
-    summaries = []
-    for _, row in result.iterrows():
-        direct_owner = owner_name_from_row(row)
-        direct_share = owner_share_from_row(row)
-        if direct_owner or direct_share:
-            owner_names.append(direct_owner)
-            owner_shares.append(direct_share)
-            summaries.append("소유주 " + direct_owner if direct_owner else "소유자명 미제공")
-            continue
-
-        dong_nm = clean_text(row.get("동명"))
-        ho_nm = clean_text(row.get("호명"))
-        owners = filter_owner_df(owner_df, dong_nm, ho_nm, clean_text(row.get("관리대장PK")))
-        display_name, display_share = owner_display_columns(owners)
-        if not display_name and juso and data_key:
-            try:
-                unit_owners = fetch_unit_owner_info(juso, data_key, dong_nm, ho_nm)
-                if not unit_owners.empty:
-                    owners = unit_owners
-                    display_name, display_share = owner_display_columns(owners)
-            except Exception:
-                pass
-
-        owner_names.append(display_name)
-        owner_shares.append(display_share)
-        summaries.append(format_owner_summary(owners, empty_text="소유주 조회결과 없음"))
-    result["성명(명칭)"] = owner_names
-    result["소유권 지분"] = owner_shares
-    result["소유주"] = summaries
-    return result
 
 
 def fetch_private_unit(juso: JusoResult, data_key: str, dong_nm: str, ho_nm: str) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -632,7 +405,6 @@ def fetch_private_unit(juso: JusoResult, data_key: str, dong_nm: str, ho_nm: str
             {
                 "동명": clean_text(row.get("dongNm")),
                 "호명": clean_text(row.get("hoNm")),
-                "관리대장PK": first_clean(row, ["mgmBldrgstPk"]) or first_clean(detail, ["mgmBldrgstPk"]),
                 "층": first_clean(row, ["flrNoNm", "flrNo"]) or first_clean(detail, ["flrNoNm", "flrNo"]),
                 "전유면적㎡": clean_text(area_sqm),
                 "전유면적py": area_py_value(area_sqm),
@@ -675,15 +447,6 @@ def parse_unit_queries(text: str, fallback_dong: str = "", fallback_ho: str = ""
 
     return queries
 
-
-def unit_owner_tables(owner_df: pd.DataFrame, address: str, query: UnitQuery) -> pd.DataFrame:
-    owners = filter_owner_df(owner_df, query.dong_nm, query.ho_nm)
-    if owners.empty:
-        return owners
-    result = owners.copy()
-    result.insert(0, "조회동호", query.label)
-    result.insert(0, "입력주소", address)
-    return result
 
 
 def geocode_kakao(address: str, kakao_key: str) -> tuple[float, float] | None:
@@ -1331,9 +1094,7 @@ def render_naver_land_api_tab(kakao_key: str, juso_key: str, data_key: str) -> N
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
-def lookup(
-    address: str, juso_key: str, data_key: str, kakao_key: str
-) -> tuple[JusoResult, BuildingResult, pd.DataFrame, pd.DataFrame]:
+def lookup(address: str, juso_key: str, data_key: str, kakao_key: str) -> tuple[JusoResult, BuildingResult, pd.DataFrame]:
     juso = search_juso(address, juso_key)
     if not juso:
         raise RuntimeError("주소를 찾지 못했습니다.")
@@ -1344,12 +1105,6 @@ def lookup(
 
     floors_df = fetch_floor_outline(juso, data_key)
     try:
-        owner_df = fetch_owner_info(juso, data_key)
-        owner_summary = format_owner_summary(owner_df)
-    except Exception:
-        owner_df = pd.DataFrame()
-        owner_summary = "소유주 조회 실패"
-    try:
         station, walk_time = nearest_subway(juso.road_addr, kakao_key) if kakao_key else ("", "")
     except Exception:
         station, walk_time = "", ""
@@ -1359,12 +1114,11 @@ def lookup(
         approval_year=format_year(clean_text(building.get("useAprDay"))),
         floors=format_floors(building.get("grndFlrCnt"), building.get("ugrndFlrCnt")),
         total_area_py=format_py(building.get("totArea")),
-        owner_summary=owner_summary,
         collective_building=format_collective_building(building),
         station=station,
         walk_time=walk_time,
     )
-    return juso, result, floors_df, owner_df
+    return juso, result, floors_df
 
 
 def render_debug(address: str, kakao_key: str) -> None:
@@ -1419,7 +1173,6 @@ def render_card(result: BuildingResult) -> None:
           <tr><td class="card-row">{html_text(result.approval_year)}</td></tr>
           <tr><td class="card-row">{html_text(result.floors)}</td></tr>
           <tr><td class="card-row">{html_text(result.total_area_py)}</td></tr>
-          <tr><td class="card-row">{html_text(result.owner_summary)}</td></tr>
         </table>
         """,
         unsafe_allow_html=True,
@@ -1528,7 +1281,6 @@ with tab_register:
             floor_tables: list[pd.DataFrame] = []
             expos_tables: list[pd.DataFrame] = []
             pubuse_tables: list[pd.DataFrame] = []
-            owner_tables: list[pd.DataFrame] = []
 
             first_tab_label = "카드 결과" if render_cards else "요약 결과"
             tab_cards, tab_floors, tab_units = st.tabs([first_tab_label, "층별 정보", "집합건물 전유부"])
@@ -1539,7 +1291,7 @@ with tab_register:
 
             for index, address in enumerate(addresses):
                 try:
-                    juso, result, floors_df, owner_df = lookup(address, juso_key, data_key, kakao_key)
+                    juso, result, floors_df = lookup(address, juso_key, data_key, kakao_key)
 
                     if render_cards or debug_mode:
                         with tab_cards:
@@ -1559,7 +1311,6 @@ with tab_register:
                             "사용승인년도": result.approval_year,
                             "층수": result.floors,
                             "연면적": result.total_area_py,
-                            "소유주": result.owner_summary,
                             "집합건물여부": result.collective_building,
                         }
                     )
@@ -1572,9 +1323,6 @@ with tab_register:
                         for unit_query in queries_to_fetch:
                             expos_df, pubuse_df = fetch_private_unit(juso, data_key, unit_query.dong_nm, unit_query.ho_nm)
                             if not expos_df.empty:
-                                expos_df = add_owner_summary_to_units(expos_df, owner_df, juso, data_key)
-                                if "관리대장PK" in expos_df.columns:
-                                    expos_df = expos_df.drop(columns=["관리대장PK"])
                                 expos_df.insert(0, "조회동호", unit_query.label)
                                 expos_df.insert(0, "입력주소", address)
                                 expos_tables.append(expos_df)
@@ -1582,9 +1330,6 @@ with tab_register:
                                 pubuse_df.insert(0, "조회동호", unit_query.label)
                                 pubuse_df.insert(0, "입력주소", address)
                                 pubuse_tables.append(pubuse_df)
-                            owners_df = unit_owner_tables(owner_df, address, unit_query)
-                            if not owners_df.empty:
-                                owner_tables.append(owners_df)
 
                 except Exception as exc:
                     st.warning(f"{address}: {exc}")
@@ -1637,17 +1382,7 @@ with tab_register:
                         file_name="building_private_common_area.csv",
                         mime="text/csv",
                     )
-                if owner_tables:
-                    owner_df = pd.concat(owner_tables, ignore_index=True)
-                    st.subheader("소유주 정보")
-                    st.dataframe(owner_df, use_container_width=True, hide_index=True)
-                    st.download_button(
-                        "소유주 정보 CSV 다운로드",
-                        data=owner_df.to_csv(index=False).encode("utf-8-sig"),
-                        file_name="building_owner_info.csv",
-                        mime="text/csv",
-                    )
-                if fetch_units and not expos_tables and not pubuse_tables and not owner_tables:
+                if fetch_units and not expos_tables and not pubuse_tables:
                     st.info("해당 전유부 정보가 없거나 조회되지 않았습니다.")
 
 
