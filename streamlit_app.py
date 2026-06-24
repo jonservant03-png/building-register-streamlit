@@ -13,6 +13,7 @@ import streamlit as st
 
 PY_PER_SQM = 1 / 3.305785
 BUILDING_API_BASE = "https://apis.data.go.kr/1613000/BldRgstHubService"
+OWNER_API_ENDPOINTS = ["getBrOwnrInfo", "getBrOwnInfo", "getBrOwnerInfo"]
 JUSO_API_URL = "https://business.juso.go.kr/addrlink/addrLinkApi.do"
 KAKAO_SUBWAY_CATEGORY = "SW8"
 KAKAO_COORD2ADDRESS_URL = "https://dapi.kakao.com/v2/local/geo/coord2address.json"
@@ -398,26 +399,75 @@ def is_private_area_row(row: dict[str, Any]) -> bool:
     return gb_code == "1" or gb_name == "전유"
 
 
+def owner_name_from_row(row: dict[str, Any] | pd.Series) -> str:
+    return first_clean(
+        row,
+        [
+            "성명(명칭)",
+            "성명",
+            "명칭",
+            "소유자명",
+            "소유주명",
+            "ownrNm",
+            "ownrName",
+            "ownerNm",
+            "ownerName",
+            "userNm",
+            "name",
+        ],
+    )
+
+
+def owner_share_from_row(row: dict[str, Any] | pd.Series) -> str:
+    return first_clean(
+        row,
+        [
+            "소유권 지분",
+            "소유권지분",
+            "지분",
+            "소유지분",
+            "ownrCpb",
+            "ownCpb",
+            "ownerShare",
+            "share",
+        ],
+    )
+
+
 def owner_records(rows: list[dict[str, Any]]) -> list[dict[str, str]]:
     records = []
     for row in rows:
         records.append(
             {
-                "동명": clean_text(row.get("dongNm")),
-                "호명": clean_text(row.get("hoNm")),
-                "관리대장PK": clean_text(row.get("mgmBldrgstPk")),
-                "소유주": first_clean(row, ["ownrNm", "ownerNm", "ownerName", "ownrName", "userNm"]),
-                "소유구분": clean_text(row.get("ownrGbCdNm")),
-                "지분": clean_text(row.get("ownrCpb")),
-                "공유자수": clean_text(row.get("cnrsPsnCo")),
-                "변동일": clean_text(row.get("changDt")),
+                "동명": first_clean(row, ["dongNm", "동명"]),
+                "호명": first_clean(row, ["hoNm", "호명"]),
+                "관리대장PK": first_clean(row, ["mgmBldrgstPk", "관리대장PK"]),
+                "성명(명칭)": owner_name_from_row(row),
+                "소유주": owner_name_from_row(row),
+                "소유구분": first_clean(row, ["ownrGbCdNm", "소유구분", "소유자구분"]),
+                "소유권 지분": owner_share_from_row(row),
+                "지분": owner_share_from_row(row),
+                "공유자수": first_clean(row, ["cnrsPsnCo", "공유자수"]),
+                "변동일": first_clean(row, ["changDt", "변동일"]),
             }
         )
     return records
 
 
+def fetch_owner_rows(juso: JusoResult, data_key: str, extra_params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    errors = []
+    for endpoint in OWNER_API_ENDPOINTS:
+        try:
+            rows = fetch_building_api_all_pages_with_extra(endpoint, juso, data_key, rows=100, extra_params=extra_params)
+            if rows:
+                return rows
+        except ApiRequestError as exc:
+            errors.append(f"{endpoint}: {exc}")
+    return []
+
+
 def fetch_owner_info(juso: JusoResult, data_key: str) -> pd.DataFrame:
-    rows = fetch_building_api_all_pages_with_extra("getBrOwnrInfo", juso, data_key, rows=100)
+    rows = fetch_owner_rows(juso, data_key)
     return pd.DataFrame(owner_records(rows))
 
 
@@ -427,7 +477,7 @@ def fetch_unit_owner_info(juso: JusoResult, data_key: str, dong_nm: str, ho_nm: 
         extra_params["dongNm"] = dong_nm
     if ho_nm:
         extra_params["hoNm"] = ho_nm
-    rows = fetch_building_api_all_pages_with_extra("getBrOwnrInfo", juso, data_key, rows=100, extra_params=extra_params)
+    rows = fetch_owner_rows(juso, data_key, extra_params=extra_params)
     if dong_nm or ho_nm:
         filtered_rows = filter_by_dong_ho(rows, dong_nm, ho_nm)
         if filtered_rows:
@@ -459,13 +509,28 @@ def filter_owner_df(owner_df: pd.DataFrame, dong_nm: str, ho_nm: str, mgm_bldrgs
     return result
 
 
+def owner_display_columns(owner_df: pd.DataFrame) -> tuple[str, str]:
+    if owner_df.empty:
+        return "", ""
+
+    name_col = "성명(명칭)" if "성명(명칭)" in owner_df.columns else "소유주" if "소유주" in owner_df.columns else ""
+    share_col = "소유권 지분" if "소유권 지분" in owner_df.columns else "지분" if "지분" in owner_df.columns else ""
+
+    names = []
+    if name_col:
+        names = [name for name in owner_df[name_col].dropna().map(clean_text).drop_duplicates().tolist() if name]
+    shares = []
+    if share_col:
+        shares = [share for share in owner_df[share_col].dropna().map(clean_text).drop_duplicates().tolist() if share]
+    return ", ".join(names), ", ".join(shares)
+
+
 def format_owner_summary(owner_df: pd.DataFrame, empty_text: str = "소유주 정보 없음", limit: int = 2) -> str:
     if owner_df.empty:
         return empty_text
 
-    names = []
-    if "소유주" in owner_df.columns:
-        names = [name for name in owner_df["소유주"].dropna().map(clean_text).drop_duplicates().tolist() if name]
+    display_names, _ = owner_display_columns(owner_df)
+    names = [name.strip() for name in display_names.split(",") if name.strip()]
     if names and len(names) <= limit:
         return "소유주 " + ", ".join(names)
     if names:
@@ -492,26 +557,36 @@ def add_owner_summary_to_units(
         return expos_df
 
     result = expos_df.copy()
+    owner_names = []
+    owner_shares = []
     summaries = []
     for _, row in result.iterrows():
-        direct_owner = first_clean(row, ["소유주", "ownrNm", "ownerNm", "ownerName", "ownrName", "userNm"])
-        if direct_owner:
-            summaries.append("소유주 " + direct_owner)
+        direct_owner = owner_name_from_row(row)
+        direct_share = owner_share_from_row(row)
+        if direct_owner or direct_share:
+            owner_names.append(direct_owner)
+            owner_shares.append(direct_share)
+            summaries.append("소유주 " + direct_owner if direct_owner else "소유자명 미제공")
             continue
 
         dong_nm = clean_text(row.get("동명"))
         ho_nm = clean_text(row.get("호명"))
         owners = filter_owner_df(owner_df, dong_nm, ho_nm, clean_text(row.get("관리대장PK")))
-        has_named_owner = not owners.empty and "소유주" in owners.columns and owners["소유주"].map(clean_text).any()
-        if not has_named_owner and juso and data_key:
+        display_name, display_share = owner_display_columns(owners)
+        if not display_name and juso and data_key:
             try:
                 unit_owners = fetch_unit_owner_info(juso, data_key, dong_nm, ho_nm)
                 if not unit_owners.empty:
                     owners = unit_owners
+                    display_name, display_share = owner_display_columns(owners)
             except Exception:
                 pass
 
+        owner_names.append(display_name)
+        owner_shares.append(display_share)
         summaries.append(format_owner_summary(owners, empty_text="소유주 조회결과 없음"))
+    result["성명(명칭)"] = owner_names
+    result["소유권 지분"] = owner_shares
     result["소유주"] = summaries
     return result
 
