@@ -327,8 +327,22 @@ def filter_by_dong_ho(rows: list[dict[str, Any]], dong_nm: str, ho_nm: str) -> l
 
 
 def unit_key(value: Any, suffix: str) -> str:
-    text = clean_text(value)
-    return text.replace(suffix, "").replace(" ", "")
+    text = clean_text(value).replace(suffix, "").replace(" ", "")
+    return str(int(text)) if text.isdigit() else text
+
+
+def first_clean(row: dict[str, Any] | pd.Series, keys: list[str]) -> str:
+    for key in keys:
+        value = clean_text(row.get(key))
+        if value:
+            return value
+    return ""
+
+
+def is_private_area_row(row: dict[str, Any]) -> bool:
+    gb_code = clean_text(row.get("exposPubuseGbCd"))
+    gb_name = clean_text(row.get("exposPubuseGbCdNm"))
+    return gb_code == "1" or gb_name == "전유"
 
 
 def owner_records(rows: list[dict[str, Any]]) -> list[dict[str, str]]:
@@ -338,7 +352,8 @@ def owner_records(rows: list[dict[str, Any]]) -> list[dict[str, str]]:
             {
                 "동명": clean_text(row.get("dongNm")),
                 "호명": clean_text(row.get("hoNm")),
-                "소유주": clean_text(row.get("ownrNm")),
+                "관리대장PK": clean_text(row.get("mgmBldrgstPk")),
+                "소유주": first_clean(row, ["ownrNm", "ownerNm", "ownerName"]),
                 "소유구분": clean_text(row.get("ownrGbCdNm")),
                 "지분": clean_text(row.get("ownrCpb")),
                 "공유자수": clean_text(row.get("cnrsPsnCo")),
@@ -353,17 +368,27 @@ def fetch_owner_info(juso: JusoResult, data_key: str) -> pd.DataFrame:
     return pd.DataFrame(owner_records(rows))
 
 
-def filter_owner_df(owner_df: pd.DataFrame, dong_nm: str, ho_nm: str) -> pd.DataFrame:
+def filter_owner_df(owner_df: pd.DataFrame, dong_nm: str, ho_nm: str, mgm_bldrgst_pk: str = "") -> pd.DataFrame:
     if owner_df.empty:
         return owner_df
+
+    pk = clean_text(mgm_bldrgst_pk)
+    if pk and "관리대장PK" in owner_df.columns:
+        by_pk = owner_df[owner_df["관리대장PK"].map(clean_text) == pk]
+        if not by_pk.empty:
+            return by_pk
 
     result = owner_df
     dong = unit_key(dong_nm, "동")
     ho = unit_key(ho_nm, "호")
     if dong and "동명" in result.columns:
-        result = result[result["동명"].map(lambda value: unit_key(value, "동") == dong)]
+        exact = result[result["동명"].map(lambda value: unit_key(value, "동") == dong)]
+        relaxed = result[result["동명"].map(lambda value: dong in unit_key(value, "동"))]
+        result = exact if not exact.empty else relaxed if not relaxed.empty else result
     if ho and "호명" in result.columns:
-        result = result[result["호명"].map(lambda value: unit_key(value, "호") == ho)]
+        exact = result[result["호명"].map(lambda value: unit_key(value, "호") == ho)]
+        relaxed = result[result["호명"].map(lambda value: ho in unit_key(value, "호"))]
+        result = exact if not exact.empty else relaxed if not relaxed.empty else result
     return result
 
 
@@ -393,7 +418,16 @@ def add_owner_summary_to_units(expos_df: pd.DataFrame, owner_df: pd.DataFrame) -
     result = expos_df.copy()
     summaries = []
     for _, row in result.iterrows():
-        owners = filter_owner_df(owner_df, clean_text(row.get("동명")), clean_text(row.get("호명")))
+        direct_owner = first_clean(row, ["소유주", "ownrNm", "ownerNm", "ownerName"])
+        if direct_owner:
+            summaries.append("소유주 " + direct_owner)
+            continue
+        owners = filter_owner_df(
+            owner_df,
+            clean_text(row.get("동명")),
+            clean_text(row.get("호명")),
+            clean_text(row.get("관리대장PK")),
+        )
         summaries.append(format_owner_summary(owners, empty_text=""))
     result["소유주"] = summaries
     return result
@@ -415,23 +449,35 @@ def fetch_private_unit(juso: JusoResult, data_key: str, dong_nm: str, ho_nm: str
         expos_rows = filter_by_dong_ho(expos_rows, dong_nm, ho_nm)
         pubuse_rows = filter_by_dong_ho(pubuse_rows, dong_nm, ho_nm)
 
+    expos_by_unit = {
+        (unit_key(row.get("dongNm"), "동"), unit_key(row.get("hoNm"), "호")): row for row in expos_rows
+    }
+
     expos_records = []
-    for row in expos_rows:
-        area_sqm = row.get("area") or row.get("exposArea")
+    for row in pubuse_rows:
+        if not is_private_area_row(row):
+            continue
+        key = (unit_key(row.get("dongNm"), "동"), unit_key(row.get("hoNm"), "호"))
+        detail = expos_by_unit.get(key, {})
+        area_sqm = first_clean(row, ["area", "exposArea", "exposAreaSum", "totArea"])
+        purpose = first_clean(row, ["mainPurpsCdNm", "etcPurps"]) or first_clean(detail, ["mainPurpsCdNm", "etcPurps"])
         expos_records.append(
             {
                 "동명": clean_text(row.get("dongNm")),
                 "호명": clean_text(row.get("hoNm")),
-                "층": clean_text(row.get("flrNoNm")) or clean_text(row.get("flrNo")),
+                "관리대장PK": first_clean(row, ["mgmBldrgstPk"]) or first_clean(detail, ["mgmBldrgstPk"]),
+                "층": first_clean(row, ["flrNoNm", "flrNo"]) or first_clean(detail, ["flrNoNm", "flrNo"]),
                 "전유면적㎡": clean_text(area_sqm),
                 "전유면적py": area_py_value(area_sqm),
-                "용도": clean_text(row.get("mainPurpsCdNm")),
+                "용도": purpose,
             }
         )
 
     pubuse_records = []
     for row in pubuse_rows:
-        area_sqm = row.get("area")
+        if is_private_area_row(row):
+            continue
+        area_sqm = first_clean(row, ["area", "exposArea", "exposAreaSum", "totArea"])
         pubuse_records.append(
             {
                 "동명": clean_text(row.get("dongNm")),
@@ -1373,6 +1419,8 @@ with tab_register:
                             expos_df, pubuse_df = fetch_private_unit(juso, data_key, unit_query.dong_nm, unit_query.ho_nm)
                             if not expos_df.empty:
                                 expos_df = add_owner_summary_to_units(expos_df, owner_df)
+                                if "관리대장PK" in expos_df.columns:
+                                    expos_df = expos_df.drop(columns=["관리대장PK"])
                                 expos_df.insert(0, "조회동호", unit_query.label)
                                 expos_df.insert(0, "입력주소", address)
                                 expos_tables.append(expos_df)
