@@ -184,6 +184,13 @@ def normalize_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return item if isinstance(item, list) else []
 
 
+def response_total_count(payload: dict[str, Any]) -> int:
+    try:
+        return int(payload.get("response", {}).get("body", {}).get("totalCount") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def ensure_success_response(payload: dict[str, Any]) -> None:
     header = payload.get("response", {}).get("header", {})
     code = clean_text(header.get("resultCode"))
@@ -285,6 +292,43 @@ def fetch_building_api_with_extra(
     raise ApiRequestError("건축물대장 API 호출이 모두 실패했습니다. " + " / ".join(errors))
 
 
+def fetch_building_api_all_pages_with_extra(
+    endpoint: str,
+    juso: JusoResult,
+    data_key: str,
+    rows: int = 100,
+    extra_params: dict[str, Any] | None = None,
+    max_pages: int = 30,
+) -> list[dict[str, Any]]:
+    errors: list[str] = []
+    per_page = min(max(int(rows or 100), 1), 100)
+    for index, service_key in enumerate(data_key_candidates(data_key), start=1):
+        try:
+            first_params = building_params(juso, service_key, rows=per_page)
+            if extra_params:
+                first_params.update(extra_params)
+            first_params["pageNo"] = 1
+            first = request_json(f"{BUILDING_API_BASE}/{endpoint}", first_params)
+            ensure_success_response(first)
+            items = normalize_items(first)
+            total = response_total_count(first)
+            total_pages = min(max((total + per_page - 1) // per_page, 1), max_pages)
+
+            for page_no in range(2, total_pages + 1):
+                params = building_params(juso, service_key, rows=per_page)
+                if extra_params:
+                    params.update(extra_params)
+                params["pageNo"] = page_no
+                data = request_json(f"{BUILDING_API_BASE}/{endpoint}", params)
+                ensure_success_response(data)
+                items.extend(normalize_items(data))
+            return items
+        except ApiRequestError as exc:
+            errors.append(f"{index}차 시도 실패: {exc}")
+            continue
+    raise ApiRequestError("건축물대장 API 호출이 모두 실패했습니다. " + " / ".join(errors))
+
+
 def fetch_building_title(juso: JusoResult, data_key: str) -> dict[str, Any] | None:
     items = fetch_building_api("getBrTitleInfo", juso, data_key, rows=30)
     if not items:
@@ -362,7 +406,7 @@ def owner_records(rows: list[dict[str, Any]]) -> list[dict[str, str]]:
                 "동명": clean_text(row.get("dongNm")),
                 "호명": clean_text(row.get("hoNm")),
                 "관리대장PK": clean_text(row.get("mgmBldrgstPk")),
-                "소유주": first_clean(row, ["ownrNm", "ownerNm", "ownerName"]),
+                "소유주": first_clean(row, ["ownrNm", "ownerNm", "ownerName", "ownrName", "userNm"]),
                 "소유구분": clean_text(row.get("ownrGbCdNm")),
                 "지분": clean_text(row.get("ownrCpb")),
                 "공유자수": clean_text(row.get("cnrsPsnCo")),
@@ -373,7 +417,7 @@ def owner_records(rows: list[dict[str, Any]]) -> list[dict[str, str]]:
 
 
 def fetch_owner_info(juso: JusoResult, data_key: str) -> pd.DataFrame:
-    rows = fetch_building_api_with_extra("getBrOwnrInfo", juso, data_key, rows=1000)
+    rows = fetch_building_api_all_pages_with_extra("getBrOwnrInfo", juso, data_key, rows=100)
     return pd.DataFrame(owner_records(rows))
 
 
@@ -383,9 +427,11 @@ def fetch_unit_owner_info(juso: JusoResult, data_key: str, dong_nm: str, ho_nm: 
         extra_params["dongNm"] = dong_nm
     if ho_nm:
         extra_params["hoNm"] = ho_nm
-    rows = fetch_building_api_with_extra("getBrOwnrInfo", juso, data_key, rows=1000, extra_params=extra_params)
+    rows = fetch_building_api_all_pages_with_extra("getBrOwnrInfo", juso, data_key, rows=100, extra_params=extra_params)
     if dong_nm or ho_nm:
-        rows = filter_by_dong_ho(rows, dong_nm, ho_nm)
+        filtered_rows = filter_by_dong_ho(rows, dong_nm, ho_nm)
+        if filtered_rows:
+            rows = filtered_rows
     return pd.DataFrame(owner_records(rows))
 
 
@@ -414,15 +460,22 @@ def filter_owner_df(owner_df: pd.DataFrame, dong_nm: str, ho_nm: str, mgm_bldrgs
 
 
 def format_owner_summary(owner_df: pd.DataFrame, empty_text: str = "소유주 정보 없음", limit: int = 2) -> str:
-    if owner_df.empty or "소유주" not in owner_df.columns:
+    if owner_df.empty:
         return empty_text
 
-    names = [name for name in owner_df["소유주"].dropna().map(clean_text).drop_duplicates().tolist() if name]
-    if not names:
-        return f"소유주 {len(owner_df):,}명" if len(owner_df) else empty_text
-    if len(names) <= limit:
+    names = []
+    if "소유주" in owner_df.columns:
+        names = [name for name in owner_df["소유주"].dropna().map(clean_text).drop_duplicates().tolist() if name]
+    if names and len(names) <= limit:
         return "소유주 " + ", ".join(names)
-    return f"소유주 {', '.join(names[:limit])} 외 {len(names) - limit}명"
+    if names:
+        return f"소유주 {', '.join(names[:limit])} 외 {len(names) - limit}명"
+
+    owner_types = []
+    if "소유구분" in owner_df.columns:
+        owner_types = [value for value in owner_df["소유구분"].dropna().map(clean_text).drop_duplicates().tolist() if value]
+    type_text = f"({', '.join(owner_types[:2])})" if owner_types else ""
+    return f"소유자명 미제공 {len(owner_df):,}명{type_text}" if len(owner_df) else empty_text
 
 
 def format_collective_building(building: dict[str, Any]) -> str:
@@ -441,7 +494,7 @@ def add_owner_summary_to_units(
     result = expos_df.copy()
     summaries = []
     for _, row in result.iterrows():
-        direct_owner = first_clean(row, ["소유주", "ownrNm", "ownerNm", "ownerName"])
+        direct_owner = first_clean(row, ["소유주", "ownrNm", "ownerNm", "ownerName", "ownrName", "userNm"])
         if direct_owner:
             summaries.append("소유주 " + direct_owner)
             continue
@@ -458,7 +511,7 @@ def add_owner_summary_to_units(
             except Exception:
                 pass
 
-        summaries.append(format_owner_summary(owners, empty_text=""))
+        summaries.append(format_owner_summary(owners, empty_text="소유주 조회결과 없음"))
     result["소유주"] = summaries
     return result
 
