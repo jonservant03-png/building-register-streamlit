@@ -122,12 +122,21 @@ def format_py(area_sqm: Any) -> str:
     return f"{round(value):,} py" if value else ""
 
 
-def area_py_value(area_sqm: Any) -> str:
+def area_float(area_sqm: Any) -> float:
     try:
-        value = float(area_sqm or 0) * PY_PER_SQM
+        return float(area_sqm or 0)
     except (TypeError, ValueError):
-        return ""
+        return 0.0
+
+
+def area_py_value(area_sqm: Any) -> str:
+    value = area_float(area_sqm) * PY_PER_SQM
     return f"{value:.1f}" if value else ""
+
+
+def area_sqm_value(area_sqm: Any) -> str:
+    value = area_float(area_sqm)
+    return f"{value:.2f}" if value else ""
 
 
 def display_address(juso: JusoResult) -> str:
@@ -368,6 +377,18 @@ def fetch_owner_info(juso: JusoResult, data_key: str) -> pd.DataFrame:
     return pd.DataFrame(owner_records(rows))
 
 
+def fetch_unit_owner_info(juso: JusoResult, data_key: str, dong_nm: str, ho_nm: str) -> pd.DataFrame:
+    extra_params = {}
+    if dong_nm:
+        extra_params["dongNm"] = dong_nm
+    if ho_nm:
+        extra_params["hoNm"] = ho_nm
+    rows = fetch_building_api_with_extra("getBrOwnrInfo", juso, data_key, rows=1000, extra_params=extra_params)
+    if dong_nm or ho_nm:
+        rows = filter_by_dong_ho(rows, dong_nm, ho_nm)
+    return pd.DataFrame(owner_records(rows))
+
+
 def filter_owner_df(owner_df: pd.DataFrame, dong_nm: str, ho_nm: str, mgm_bldrgst_pk: str = "") -> pd.DataFrame:
     if owner_df.empty:
         return owner_df
@@ -411,7 +432,9 @@ def format_collective_building(building: dict[str, Any]) -> str:
     return "예" if "집합" in register_type else "아니오"
 
 
-def add_owner_summary_to_units(expos_df: pd.DataFrame, owner_df: pd.DataFrame) -> pd.DataFrame:
+def add_owner_summary_to_units(
+    expos_df: pd.DataFrame, owner_df: pd.DataFrame, juso: JusoResult | None = None, data_key: str = ""
+) -> pd.DataFrame:
     if expos_df.empty:
         return expos_df
 
@@ -422,12 +445,19 @@ def add_owner_summary_to_units(expos_df: pd.DataFrame, owner_df: pd.DataFrame) -
         if direct_owner:
             summaries.append("소유주 " + direct_owner)
             continue
-        owners = filter_owner_df(
-            owner_df,
-            clean_text(row.get("동명")),
-            clean_text(row.get("호명")),
-            clean_text(row.get("관리대장PK")),
-        )
+
+        dong_nm = clean_text(row.get("동명"))
+        ho_nm = clean_text(row.get("호명"))
+        owners = filter_owner_df(owner_df, dong_nm, ho_nm, clean_text(row.get("관리대장PK")))
+        has_named_owner = not owners.empty and "소유주" in owners.columns and owners["소유주"].map(clean_text).any()
+        if not has_named_owner and juso and data_key:
+            try:
+                unit_owners = fetch_unit_owner_info(juso, data_key, dong_nm, ho_nm)
+                if not unit_owners.empty:
+                    owners = unit_owners
+            except Exception:
+                pass
+
         summaries.append(format_owner_summary(owners, empty_text=""))
     result["소유주"] = summaries
     return result
@@ -452,6 +482,14 @@ def fetch_private_unit(juso: JusoResult, data_key: str, dong_nm: str, ho_nm: str
     expos_by_unit = {
         (unit_key(row.get("dongNm"), "동"), unit_key(row.get("hoNm"), "호")): row for row in expos_rows
     }
+    common_area_by_unit: dict[tuple[str, str], float] = {}
+    for row in pubuse_rows:
+        if is_private_area_row(row):
+            continue
+        key = (unit_key(row.get("dongNm"), "동"), unit_key(row.get("hoNm"), "호"))
+        common_area_by_unit[key] = common_area_by_unit.get(key, 0.0) + area_float(
+            first_clean(row, ["area", "exposArea", "exposAreaSum", "totArea"])
+        )
 
     expos_records = []
     for row in pubuse_rows:
@@ -460,6 +498,7 @@ def fetch_private_unit(juso: JusoResult, data_key: str, dong_nm: str, ho_nm: str
         key = (unit_key(row.get("dongNm"), "동"), unit_key(row.get("hoNm"), "호"))
         detail = expos_by_unit.get(key, {})
         area_sqm = first_clean(row, ["area", "exposArea", "exposAreaSum", "totArea"])
+        common_area_sqm = common_area_by_unit.get(key, 0.0)
         purpose = first_clean(row, ["mainPurpsCdNm", "etcPurps"]) or first_clean(detail, ["mainPurpsCdNm", "etcPurps"])
         expos_records.append(
             {
@@ -469,26 +508,13 @@ def fetch_private_unit(juso: JusoResult, data_key: str, dong_nm: str, ho_nm: str
                 "층": first_clean(row, ["flrNoNm", "flrNo"]) or first_clean(detail, ["flrNoNm", "flrNo"]),
                 "전유면적㎡": clean_text(area_sqm),
                 "전유면적py": area_py_value(area_sqm),
+                "전유공용면적합계㎡": area_sqm_value(common_area_sqm),
+                "전유공용면적합계py": area_py_value(common_area_sqm),
                 "용도": purpose,
             }
         )
 
-    pubuse_records = []
-    for row in pubuse_rows:
-        if is_private_area_row(row):
-            continue
-        area_sqm = first_clean(row, ["area", "exposArea", "exposAreaSum", "totArea"])
-        pubuse_records.append(
-            {
-                "동명": clean_text(row.get("dongNm")),
-                "호명": clean_text(row.get("hoNm")),
-                "구분": clean_text(row.get("exposPubuseGbCdNm")),
-                "공용면적㎡": clean_text(area_sqm),
-                "공용면적py": area_py_value(area_sqm),
-            }
-        )
-
-    return pd.DataFrame(expos_records), pd.DataFrame(pubuse_records)
+    return pd.DataFrame(expos_records), pd.DataFrame()
 
 
 def parse_unit_queries(text: str, fallback_dong: str = "", fallback_ho: str = "") -> list[UnitQuery]:
@@ -1418,7 +1444,7 @@ with tab_register:
                         for unit_query in queries_to_fetch:
                             expos_df, pubuse_df = fetch_private_unit(juso, data_key, unit_query.dong_nm, unit_query.ho_nm)
                             if not expos_df.empty:
-                                expos_df = add_owner_summary_to_units(expos_df, owner_df)
+                                expos_df = add_owner_summary_to_units(expos_df, owner_df, juso, data_key)
                                 if "관리대장PK" in expos_df.columns:
                                     expos_df = expos_df.drop(columns=["관리대장PK"])
                                 expos_df.insert(0, "조회동호", unit_query.label)
