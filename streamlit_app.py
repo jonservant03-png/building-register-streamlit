@@ -1290,6 +1290,7 @@ with tab_register:
         height=140,
         placeholder="예: 경기도 수원시 영통구 효원로 400\n여러 건은 줄바꿈으로 입력",
     )
+    render_cards = st.checkbox("카드 결과 생성", value=False)
 
     with st.expander("집합건물 전유부 조회 옵션"):
         st.caption("여러 전유부는 줄바꿈으로 입력하세요. 예: 101동 301호 / 101동,302호 / 303호")
@@ -1320,20 +1321,24 @@ with tab_register:
             pubuse_tables: list[pd.DataFrame] = []
             owner_tables: list[pd.DataFrame] = []
 
-            tab_cards, tab_floors, tab_units = st.tabs(["카드 결과", "층별 정보", "집합건물 전유부"])
+            first_tab_label = "카드 결과" if render_cards else "요약 결과"
+            tab_cards, tab_floors, tab_units = st.tabs([first_tab_label, "층별 정보", "집합건물 전유부"])
 
-            with tab_cards:
-                cols = st.columns(3)
+            if render_cards:
+                with tab_cards:
+                    cols = st.columns(3)
 
             for index, address in enumerate(addresses):
                 try:
                     juso, result, floors_df, owner_df = lookup(address, juso_key, data_key, kakao_key)
 
-                    with tab_cards:
-                        with cols[index % 3]:
-                            render_card(result)
-                        if debug_mode:
-                            render_debug(juso.road_addr, kakao_key)
+                    if render_cards or debug_mode:
+                        with tab_cards:
+                            if render_cards:
+                                with cols[index % 3]:
+                                    render_card(result)
+                            if debug_mode:
+                                render_debug(juso.road_addr, kakao_key)
 
                     summary_rows.append(
                         {
