@@ -3,6 +3,7 @@ import io
 import json
 import re
 import shlex
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, unquote, urlsplit, urlunsplit
@@ -462,6 +463,7 @@ def geocode_kakao(address: str, kakao_key: str) -> tuple[float, float] | None:
 
 
 WALK_MINUTE_THRESHOLD = 20
+WALK_METERS_PER_MINUTE = 67
 
 
 def format_station_name(place_name: str) -> str:
@@ -504,37 +506,93 @@ def find_nearest_subway(x: float, y: float, kakao_key: str) -> tuple[str, int] |
 LANDMARK_RADIUS = 3000  # '인근'으로 부를 수 있는 최대 거리(m)
 
 
-LANDMARK_NAME_EXCLUDE = ("화물",)  # '양재화물터미널' 등 랜드마크로 부적절한 명칭 제외
+LANDMARK_NAME_EXCLUDE = ("화물",)  # "양재화물터미널" 등 랜드마크로 부적절한 명칭 제외
+PRIORITY_PUBLIC_QUERIES = (
+    "구청",
+    "시청",
+    "도청",
+    "검찰청",
+    "법원",
+    "공기업 본사",
+    "공기업 본부",
+    "공단 본사",
+    "공단 본부",
+    "공사 본사",
+    "공사 본부",
+    "국민연금공단 본사",
+    "국민연금공단 본부",
+)
+PRIORITY_GOV_KEYWORDS = ("구청", "시청", "도청", "검찰청", "법원")
+GENERIC_PUBLIC_CORP_KEYWORDS = ("공기업", "공단", "공사")
+SPECIFIC_PUBLIC_CORP_KEYWORDS = (
+    "국민연금공단",
+    "국민건강보험공단",
+    "근로복지공단",
+    "한국전력공사",
+    "한국토지주택공사",
+    "한국도로공사",
+    "한국수자원공사",
+    "한국가스공사",
+    "한국철도공사",
+)
+HQ_KEYWORDS = ("본사", "본부")
+PUBLIC_CATEGORY_KEYWORDS = ("공공", "사회기관", "행정", "관공서")
+TRANSIT_CATEGORY_KEYWORDS = ("교통", "수송", "지하철", "전철", "버스", "터미널", "기차", "철도", "공항")
+OTHER_TRANSIT_SEARCHES = (
+    ({"query": "버스터미널"}, ("터미널",)),
+    ({"query": "터미널"}, ("터미널",)),
+    ({"query": "기차역"}, ("기차", "철도")),
+    ({"query": "철도역"}, ("기차", "철도")),
+    ({"query": "공항"}, ("공항",)),
+)
+
+
+def walk_minutes(distance_m: int) -> int:
+    return max(1, round(distance_m / WALK_METERS_PER_MINUTE))
 
 
 def subway_label(subway: tuple[str, int]) -> tuple[str, str]:
-    """지하철 (역명, 거리m) -> ('노선 역이름', '도보 NN분'). 20분 초과여도 분 단위 표기."""
+    """지하철 (역명, 거리m) -> ('노선 역이름', '도보 NN분')."""
     place_name, distance_m = subway
-    minutes = max(1, round(distance_m / 67))
-    return format_station_name(place_name), f"도보 {minutes}분"
+    return format_station_name(place_name), f"도보 {walk_minutes(distance_m)}분"
+
+
+def landmark_label(name: str, distance_m: int | None = None) -> tuple[str, str]:
+    if distance_m is None:
+        return f"{name} 인근", ""
+    minutes = walk_minutes(distance_m)
+    if minutes <= WALK_MINUTE_THRESHOLD:
+        return name, f"도보 {minutes}분"
+    return f"{name} 인근", ""
+
+
+def is_priority_public_place(name: str, category: str) -> bool:
+    if any(word in category for word in TRANSIT_CATEGORY_KEYWORDS):
+        return False
+    if any(word in name for word in PRIORITY_GOV_KEYWORDS):
+        return True
+    is_hq = any(word in name for word in HQ_KEYWORDS)
+    if not is_hq:
+        return False
+    if any(word in name for word in SPECIFIC_PUBLIC_CORP_KEYWORDS):
+        return True
+    is_generic_public_corp = any(word in name for word in GENERIC_PUBLIC_CORP_KEYWORDS)
+    is_public_category = any(word in category for word in PUBLIC_CATEGORY_KEYWORDS)
+    return is_generic_public_corp and is_public_category
 
 
 def find_nearest_landmark(
     x: float, y: float, kakao_key: str, subway: tuple[str, int] | None = None
 ) -> tuple[str, str]:
-    """교통시설 > 관공서 > 백화점 > 대학교 > IC(고속도로 진입로) 순으로 표기 반환.
-
-    지하철역이 당첨이면 ('노선 역이름', '도보 NN분'), 그 외(터미널/시청/백화점 등)는
-    ('OO 인근', '') 형태. Kakao 응답의 distance 값으로 반경 내 최근접만 고른다.
-    """
+    """주요 공공기관 > 교통시설 > 관공서 > 백화점 > 대학교 > IC 순으로 표기 반환."""
 
     def nearest(
         path: str,
         queries: list[dict[str, Any]],
         require: tuple[str, ...] | None = None,
         require_cat: tuple[str, ...] | None = None,
+        predicate: Callable[[str, str], bool] | None = None,
     ) -> tuple[str, int | None]:
-        """반경 내 최근접 후보 (이름, 거리m).
-
-        require: 장소명에 이 단어 중 하나가 있어야 채택.
-        require_cat: 업종분류(category_name)에 이 단어 중 하나가 있어야 채택.
-          → '브라운도트호텔 군산터미널점'처럼 이름만 터미널인 가짜를 분류로 걸러낸다.
-        """
         best_name, best_dist = "", None
         for extra in queries:
             params = {"x": x, "y": y, "radius": LANDMARK_RADIUS, "sort": "distance", "size": 15}
@@ -551,39 +609,38 @@ def find_nearest_landmark(
                     continue
                 if require_cat and not any(word in category for word in require_cat):
                     continue
+                if predicate and not predicate(name, category):
+                    continue
                 if best_dist is None or dist < best_dist:
                     best_name, best_dist = name, dist
         return best_name, best_dist
 
-    # 1) 교통시설: 지하철역 / 버스터미널 / 기차역 중 최근접 (업종분류로 가짜 제외)
-    transit: list[tuple[str, str, int]] = []  # (kind, name, dist)
-    if subway:
-        transit.append(("subway", subway[0], subway[1]))
-    term_name, term_dist = nearest("search/keyword.json", [{"query": "터미널"}], require_cat=("터미널",))
-    if term_name and term_dist is not None:
-        transit.append(("other", term_name, term_dist))
-    train_name, train_dist = nearest("search/keyword.json", [{"query": "기차역"}], require_cat=("기차",))
-    if train_name and train_dist is not None:
-        transit.append(("other", train_name, train_dist))
-    if transit:
-        kind, name, dist = min(transit, key=lambda t: t[2])
-        if kind == "subway":
-            return subway_label((name, dist))
+    name, _ = nearest(
+        "search/keyword.json",
+        [{"query": query} for query in PRIORITY_PUBLIC_QUERIES],
+        predicate=is_priority_public_place,
+    )
+    if name:
         return f"{name} 인근", ""
 
-    # 2) 관공서(공공기관)
+    transit: list[tuple[str, int]] = []
+    for query, categories in OTHER_TRANSIT_SEARCHES:
+        name, dist = nearest("search/keyword.json", [query], require_cat=categories)
+        if name and dist is not None:
+            transit.append((name, dist))
+    if transit:
+        name, dist = min(transit, key=lambda t: t[1])
+        return landmark_label(name, dist)
+
     name, _ = nearest("search/category.json", [{"category_group_code": "PO3"}])
     if name:
         return f"{name} 인근", ""
-    # 3) 백화점
     name, _ = nearest("search/keyword.json", [{"query": "백화점"}], require_cat=("백화점",))
     if name:
         return f"{name} 인근", ""
-    # 4) 대학교
     name, _ = nearest("search/keyword.json", [{"query": "대학교"}], require_cat=("대학교",))
     if name:
         return f"{name} 인근", ""
-    # 5) IC/고속도로 진입로
     name, _ = nearest(
         "search/keyword.json", [{"query": "IC"}, {"query": "나들목"}], require=("IC", "JC", "나들목")
     )
@@ -602,7 +659,7 @@ def nearest_subway(address: str, kakao_key: str) -> tuple[str, str]:
     x, y = point
     subway = find_nearest_subway(x, y, kakao_key)
     if subway:
-        minutes = max(1, round(subway[1] / 67))
+        minutes = walk_minutes(subway[1])
         if minutes <= WALK_MINUTE_THRESHOLD:
             return subway_label(subway)
 
