@@ -538,6 +538,29 @@ SPECIFIC_PUBLIC_CORP_KEYWORDS = (
 HQ_KEYWORDS = ("본사", "본부")
 PUBLIC_CATEGORY_KEYWORDS = ("공공", "사회기관", "행정", "관공서")
 TRANSIT_CATEGORY_KEYWORDS = ("교통", "수송", "지하철", "전철", "버스", "터미널", "기차", "철도", "공항")
+NON_LANDMARK_CATEGORY_KEYWORDS = (
+    "음식점",
+    "카페",
+    "술집",
+    "패스트푸드",
+    "분식",
+    "치킨",
+    "피자",
+    "제과",
+    "디저트",
+    "쇼핑",
+    "유통",
+    "소매",
+    "가정,생활",
+    "편의점",
+    "마트",
+    "슈퍼",
+    "약국",
+    "화장품",
+    "의류",
+    "패션",
+    "문구",
+)
 OTHER_TRANSIT_SEARCHES = (
     ({"query": "버스터미널"}, ("터미널",)),
     ({"query": "터미널"}, ("터미널",)),
@@ -567,6 +590,8 @@ def landmark_label(name: str, distance_m: int | None = None) -> tuple[str, str]:
 
 
 def is_priority_public_place(name: str, category: str) -> bool:
+    if any(word in category for word in NON_LANDMARK_CATEGORY_KEYWORDS):
+        return False
     if any(word in category for word in TRANSIT_CATEGORY_KEYWORDS):
         return False
     if any(word in name for word in PRIORITY_GOV_KEYWORDS):
