@@ -4,7 +4,7 @@ import json
 import re
 import shlex
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, unquote, urlsplit, urlunsplit
 
@@ -35,6 +35,15 @@ class JusoResult:
 
 
 @dataclass
+class NearbyCandidate:
+    station: str
+    walk_time: str = ""
+    distance_m: int = 0
+    priority: int = 0
+    source: str = ""
+
+
+@dataclass
 class BuildingResult:
     name: str
     address: str
@@ -44,6 +53,7 @@ class BuildingResult:
     collective_building: str = ""
     station: str = ""
     walk_time: str = ""
+    transit_candidates: list[NearbyCandidate] = field(default_factory=list)
 
 
 @dataclass
@@ -579,7 +589,6 @@ def walk_minutes(distance_m: int) -> int:
 
 
 def subway_label(subway: tuple[str, int]) -> tuple[str, str]:
-    """지하철 (역명, 거리m) -> ('노선 역이름', '도보 NN분')."""
     place_name, distance_m = subway
     return format_station_name(place_name), f"도보 {walk_minutes(distance_m)}분"
 
@@ -591,6 +600,13 @@ def landmark_label(name: str, distance_m: int | None = None) -> tuple[str, str]:
     if minutes <= WALK_MINUTE_THRESHOLD:
         return name, f"도보 {minutes}분"
     return f"{name} 인근", ""
+
+
+def candidate_display_label(candidate: NearbyCandidate) -> str:
+    label = " ".join([part for part in (candidate.station, candidate.walk_time) if part])
+    if candidate.distance_m:
+        return f"{label} - {candidate.distance_m:,}m"
+    return label or "역 정보 없음"
 
 
 def is_store_branch_name(name: str) -> bool:
@@ -617,95 +633,155 @@ def is_priority_public_place(name: str, category: str) -> bool:
     return is_generic_public_corp and is_public_category
 
 
+def add_unique_candidate(candidates: list[NearbyCandidate], candidate: NearbyCandidate) -> None:
+    key = (candidate.station, candidate.walk_time)
+    for index, existing in enumerate(candidates):
+        if (existing.station, existing.walk_time) == key:
+            if (candidate.priority, candidate.distance_m) < (existing.priority, existing.distance_m):
+                candidates[index] = candidate
+            return
+    candidates.append(candidate)
+
+
+def collect_place_candidates(
+    x: float,
+    y: float,
+    kakao_key: str,
+    path: str,
+    queries: list[dict[str, Any]],
+    priority: int,
+    formatter: Callable[[str, int], tuple[str, str]],
+    require: tuple[str, ...] | None = None,
+    require_cat: tuple[str, ...] | None = None,
+    predicate: Callable[[str, str], bool] | None = None,
+) -> list[NearbyCandidate]:
+    candidates: list[NearbyCandidate] = []
+    for extra in queries:
+        params = {"x": x, "y": y, "radius": LANDMARK_RADIUS, "sort": "distance", "size": 15}
+        params.update(extra)
+        for doc in kakao_local_search(path, params, kakao_key):
+            name = clean_text(doc.get("place_name"))
+            category = clean_text(doc.get("category_name"))
+            dist = int(doc.get("distance") or 0)
+            if not name or not dist or dist > LANDMARK_RADIUS:
+                continue
+            if any(word in name for word in LANDMARK_NAME_EXCLUDE):
+                continue
+            if require and not any(word in name for word in require):
+                continue
+            if require_cat and not any(word in category for word in require_cat):
+                continue
+            if predicate and not predicate(name, category):
+                continue
+            station, walk_time = formatter(name, dist)
+            add_unique_candidate(
+                candidates,
+                NearbyCandidate(
+                    station=station,
+                    walk_time=walk_time,
+                    distance_m=dist,
+                    priority=priority,
+                    source=name,
+                ),
+            )
+    return candidates
+
+
+def nearby_candidates_for_point(
+    x: float, y: float, kakao_key: str, subway: tuple[str, int] | None = None
+) -> list[NearbyCandidate]:
+    candidates: list[NearbyCandidate] = []
+
+    if subway:
+        station, walk_time = subway_label(subway)
+        priority = 0 if walk_minutes(subway[1]) <= WALK_MINUTE_THRESHOLD else 90
+        add_unique_candidate(candidates, NearbyCandidate(station, walk_time, subway[1], priority, subway[0]))
+
+    for candidate in collect_place_candidates(
+        x,
+        y,
+        kakao_key,
+        "search/keyword.json",
+        [{"query": query} for query in PRIORITY_PUBLIC_QUERIES],
+        priority=1,
+        formatter=lambda name, dist: (f"{name} 인근", ""),
+        predicate=is_priority_public_place,
+    ):
+        add_unique_candidate(candidates, candidate)
+
+    for query, categories in OTHER_TRANSIT_SEARCHES:
+        for candidate in collect_place_candidates(
+            x,
+            y,
+            kakao_key,
+            "search/keyword.json",
+            [query],
+            priority=2,
+            formatter=landmark_label,
+            require_cat=categories,
+        ):
+            add_unique_candidate(candidates, candidate)
+
+    for candidate in collect_place_candidates(
+        x,
+        y,
+        kakao_key,
+        "search/category.json",
+        [{"category_group_code": "PO3"}],
+        priority=3,
+        formatter=lambda name, dist: (f"{name} 인근", ""),
+    ):
+        add_unique_candidate(candidates, candidate)
+
+    followup_searches = [
+        (4, {"query": "백화점"}, ("백화점",), None),
+        (5, {"query": "대학교"}, ("대학교",), None),
+        (6, {"query": "IC"}, None, ("IC", "JC", "나들목")),
+        (6, {"query": "나들목"}, None, ("IC", "JC", "나들목")),
+    ]
+    for priority, query, require_cat, require in followup_searches:
+        for candidate in collect_place_candidates(
+            x,
+            y,
+            kakao_key,
+            "search/keyword.json",
+            [query],
+            priority=priority,
+            formatter=lambda name, dist: (f"{name} 인근", ""),
+            require=require,
+            require_cat=require_cat,
+        ):
+            add_unique_candidate(candidates, candidate)
+
+    candidates.sort(key=lambda candidate: (candidate.priority, candidate.distance_m, candidate.station))
+    return candidates[:3]
+
+
+def nearby_candidates(address: str, kakao_key: str) -> list[NearbyCandidate]:
+    if not kakao_key:
+        return []
+    point = geocode_kakao(address, kakao_key)
+    if not point:
+        return []
+    x, y = point
+    subway = find_nearest_subway(x, y, kakao_key)
+    return nearby_candidates_for_point(x, y, kakao_key, subway=subway)
+
+
 def find_nearest_landmark(
     x: float, y: float, kakao_key: str, subway: tuple[str, int] | None = None
 ) -> tuple[str, str]:
-    """주요 공공기관 > 교통시설 > 관공서 > 백화점 > 대학교 > IC 순으로 표기 반환."""
-
-    def nearest(
-        path: str,
-        queries: list[dict[str, Any]],
-        require: tuple[str, ...] | None = None,
-        require_cat: tuple[str, ...] | None = None,
-        predicate: Callable[[str, str], bool] | None = None,
-    ) -> tuple[str, int | None]:
-        best_name, best_dist = "", None
-        for extra in queries:
-            params = {"x": x, "y": y, "radius": LANDMARK_RADIUS, "sort": "distance", "size": 15}
-            params.update(extra)
-            for doc in kakao_local_search(path, params, kakao_key):
-                name = clean_text(doc.get("place_name"))
-                category = clean_text(doc.get("category_name"))
-                dist = int(doc.get("distance") or 0)
-                if not dist or dist > LANDMARK_RADIUS:
-                    continue
-                if any(word in name for word in LANDMARK_NAME_EXCLUDE):
-                    continue
-                if require and not any(word in name for word in require):
-                    continue
-                if require_cat and not any(word in category for word in require_cat):
-                    continue
-                if predicate and not predicate(name, category):
-                    continue
-                if best_dist is None or dist < best_dist:
-                    best_name, best_dist = name, dist
-        return best_name, best_dist
-
-    name, _ = nearest(
-        "search/keyword.json",
-        [{"query": query} for query in PRIORITY_PUBLIC_QUERIES],
-        predicate=is_priority_public_place,
-    )
-    if name:
-        return f"{name} 인근", ""
-
-    transit: list[tuple[str, int]] = []
-    for query, categories in OTHER_TRANSIT_SEARCHES:
-        name, dist = nearest("search/keyword.json", [query], require_cat=categories)
-        if name and dist is not None:
-            transit.append((name, dist))
-    if transit:
-        name, dist = min(transit, key=lambda t: t[1])
-        return landmark_label(name, dist)
-
-    name, _ = nearest("search/category.json", [{"category_group_code": "PO3"}])
-    if name:
-        return f"{name} 인근", ""
-    name, _ = nearest("search/keyword.json", [{"query": "백화점"}], require_cat=("백화점",))
-    if name:
-        return f"{name} 인근", ""
-    name, _ = nearest("search/keyword.json", [{"query": "대학교"}], require_cat=("대학교",))
-    if name:
-        return f"{name} 인근", ""
-    name, _ = nearest(
-        "search/keyword.json", [{"query": "IC"}, {"query": "나들목"}], require=("IC", "JC", "나들목")
-    )
-    if name:
-        return f"{name} 인근", ""
-    return "", ""
+    candidates = [candidate for candidate in nearby_candidates_for_point(x, y, kakao_key, subway=subway) if candidate.priority != 0]
+    if not candidates:
+        return "", ""
+    return candidates[0].station, candidates[0].walk_time
 
 
 def nearest_subway(address: str, kakao_key: str) -> tuple[str, str]:
-    if not kakao_key:
+    candidates = nearby_candidates(address, kakao_key)
+    if not candidates:
         return "", ""
-    point = geocode_kakao(address, kakao_key)
-    if not point:
-        return "", ""
-
-    x, y = point
-    subway = find_nearest_subway(x, y, kakao_key)
-    if subway:
-        minutes = walk_minutes(subway[1])
-        if minutes <= WALK_MINUTE_THRESHOLD:
-            return subway_label(subway)
-
-    station, walk = find_nearest_landmark(x, y, kakao_key, subway=subway)
-    if station:
-        return station, walk
-
-    if subway:
-        return subway_label(subway)
-    return "", ""
+    return candidates[0].station, candidates[0].walk_time
 
 
 def parse_naver_request(raw_input: str) -> tuple[str, dict[str, str]]:
@@ -1198,9 +1274,14 @@ def lookup(address: str, juso_key: str, data_key: str, kakao_key: str) -> tuple[
 
     floors_df = fetch_floor_outline(juso, data_key)
     try:
-        station, walk_time = nearest_subway(juso.road_addr, kakao_key) if kakao_key else ("", "")
+        transit_candidates = nearby_candidates(juso.road_addr, kakao_key) if kakao_key else []
+        if transit_candidates:
+            station, walk_time = transit_candidates[0].station, transit_candidates[0].walk_time
+        else:
+            station, walk_time = "", ""
     except Exception:
         station, walk_time = "", ""
+        transit_candidates = []
     result = BuildingResult(
         name=clean_text(building.get("bldNm")) or "건물명 없음",
         address=display_address(juso),
@@ -1210,6 +1291,7 @@ def lookup(address: str, juso_key: str, data_key: str, kakao_key: str) -> tuple[
         collective_building=format_collective_building(building),
         station=station,
         walk_time=walk_time,
+        transit_candidates=transit_candidates,
     )
     return juso, result, floors_df
 
@@ -1363,124 +1445,164 @@ with tab_register:
     if run:
         addresses = [line.strip() for line in addresses_text.splitlines() if line.strip()]
         if not juso_key or not data_key:
+            st.session_state.pop("register_lookup_payload", None)
             st.error("도로명주소 API 승인키와 공공데이터포털 서비스키를 입력해 주세요.")
         elif not addresses:
+            st.session_state.pop("register_lookup_payload", None)
             st.error("주소를 입력해 주세요.")
         else:
             unit_queries = parse_unit_queries(unit_lines_text, unit_dong, unit_ho)
             fetch_units = fetch_all_units or bool(unit_queries)
             queries_to_fetch = [UnitQuery("", "", "전체")] if fetch_all_units else unit_queries
-            summary_rows: list[dict[str, str]] = []
-            floor_tables: list[pd.DataFrame] = []
-            expos_tables: list[pd.DataFrame] = []
-            pubuse_tables: list[pd.DataFrame] = []
+            payload = {
+                "render_cards": render_cards,
+                "debug_mode": debug_mode,
+                "results": [],
+                "warnings": [],
+                "floor_tables": [],
+                "expos_tables": [],
+                "pubuse_tables": [],
+                "fetch_units": fetch_units,
+            }
 
-            first_tab_label = "카드 결과" if render_cards else "요약 결과"
-            tab_cards, tab_floors, tab_units = st.tabs([first_tab_label, "층별 정보", "집합건물 전유부"])
+            with st.spinner("조회 중..."):
+                for address in addresses:
+                    try:
+                        juso, result, floors_df = lookup(address, juso_key, data_key, kakao_key)
+                        payload["results"].append(
+                            {
+                                "input_address": address,
+                                "road_addr": juso.road_addr,
+                                "result": result,
+                            }
+                        )
 
-            if render_cards:
-                with tab_cards:
-                    cols = st.columns(3)
+                        if not floors_df.empty:
+                            floors_with_address = floors_df.copy()
+                            floors_with_address.insert(0, "입력주소", address)
+                            payload["floor_tables"].append(floors_with_address)
 
-            for index, address in enumerate(addresses):
-                try:
-                    juso, result, floors_df = lookup(address, juso_key, data_key, kakao_key)
+                        if fetch_units:
+                            for unit_query in queries_to_fetch:
+                                expos_df, pubuse_df = fetch_private_unit(
+                                    juso, data_key, unit_query.dong_nm, unit_query.ho_nm
+                                )
+                                if not expos_df.empty:
+                                    expos_with_address = expos_df.copy()
+                                    expos_with_address.insert(0, "조회동호", unit_query.label)
+                                    expos_with_address.insert(0, "입력주소", address)
+                                    payload["expos_tables"].append(expos_with_address)
+                                if not pubuse_df.empty:
+                                    pubuse_with_address = pubuse_df.copy()
+                                    pubuse_with_address.insert(0, "조회동호", unit_query.label)
+                                    pubuse_with_address.insert(0, "입력주소", address)
+                                    payload["pubuse_tables"].append(pubuse_with_address)
 
-                    if render_cards or debug_mode:
-                        with tab_cards:
-                            if render_cards:
-                                with cols[index % 3]:
-                                    render_card(result)
-                            if debug_mode:
-                                render_debug(juso.road_addr, kakao_key)
+                    except Exception as exc:
+                        payload["warnings"].append(f"{address}: {exc}")
 
-                    summary_rows.append(
-                        {
-                            "입력주소": address,
-                            "건물명": result.name,
-                            "표시주소": result.address,
-                            "가까운역": result.station,
-                            "도보시간": result.walk_time,
-                            "사용승인년도": result.approval_year,
-                            "층수": result.floors,
-                            "연면적": result.total_area_py,
-                            "집합건물여부": result.collective_building,
-                        }
-                    )
+            st.session_state["register_lookup_seq"] = int(st.session_state.get("register_lookup_seq", 0)) + 1
+            payload["seq"] = st.session_state["register_lookup_seq"]
+            st.session_state["register_lookup_payload"] = payload
 
-                    if not floors_df.empty:
-                        floors_df.insert(0, "입력주소", address)
-                        floor_tables.append(floors_df)
+    payload = st.session_state.get("register_lookup_payload")
+    if payload:
+        first_tab_label = "카드 결과" if payload["render_cards"] else "요약 결과"
+        tab_cards, tab_floors, tab_units = st.tabs([first_tab_label, "층별 정보", "집합건물 전유부"])
 
-                    if fetch_units:
-                        for unit_query in queries_to_fetch:
-                            expos_df, pubuse_df = fetch_private_unit(juso, data_key, unit_query.dong_nm, unit_query.ho_nm)
-                            if not expos_df.empty:
-                                expos_df.insert(0, "조회동호", unit_query.label)
-                                expos_df.insert(0, "입력주소", address)
-                                expos_tables.append(expos_df)
-                            if not pubuse_df.empty:
-                                pubuse_df.insert(0, "조회동호", unit_query.label)
-                                pubuse_df.insert(0, "입력주소", address)
-                                pubuse_tables.append(pubuse_df)
+        for warning in payload.get("warnings", []):
+            st.warning(warning)
 
-                except Exception as exc:
-                    st.warning(f"{address}: {exc}")
+        summary_rows: list[dict[str, str]] = []
+        with tab_cards:
+            cols = st.columns(3) if payload["render_cards"] else []
+
+            for index, item in enumerate(payload["results"]):
+                result = item["result"]
+                if payload["render_cards"]:
+                    with cols[index % 3]:
+                        candidates = getattr(result, "transit_candidates", [])
+                        if candidates:
+                            selected_index = st.selectbox(
+                                "인근 후보 Top 3",
+                                options=list(range(len(candidates))),
+                                format_func=lambda choice, candidates=candidates: candidate_display_label(candidates[choice]),
+                                key=f"transit_candidate_{payload.get('seq', 0)}_{index}",
+                            )
+                            selected_candidate = candidates[selected_index]
+                            result.station = selected_candidate.station
+                            result.walk_time = selected_candidate.walk_time
+                        render_card(result)
+                if payload["debug_mode"]:
+                    render_debug(item["road_addr"], kakao_key)
+
+                summary_rows.append(
+                    {
+                        "입력주소": item["input_address"],
+                        "건물명": result.name,
+                        "표시주소": result.address,
+                        "가까운역": result.station,
+                        "도보시간": result.walk_time,
+                        "사용승인년도": result.approval_year,
+                        "층수": result.floors,
+                        "연면적": result.total_area_py,
+                        "집합건물여부": result.collective_building,
+                    }
+                )
 
             if summary_rows:
                 summary_df = pd.DataFrame(summary_rows)
-                with tab_cards:
-                    st.subheader("표 형식 결과")
-                    st.dataframe(summary_df, use_container_width=True, hide_index=True)
-                    st.download_button(
-                        "요약 CSV 다운로드",
-                        data=summary_df.to_csv(index=False).encode("utf-8-sig"),
-                        file_name="building_register_summary.csv",
-                        mime="text/csv",
-                    )
+                st.subheader("표 형식 결과")
+                st.dataframe(summary_df, use_container_width=True, hide_index=True)
+                st.download_button(
+                    "요약 CSV 다운로드",
+                    data=summary_df.to_csv(index=False).encode("utf-8-sig"),
+                    file_name="building_register_summary.csv",
+                    mime="text/csv",
+                )
 
-            with tab_floors:
-                if floor_tables:
-                    floor_df = pd.concat(floor_tables, ignore_index=True)
-                    st.dataframe(floor_df, use_container_width=True, hide_index=True)
-                    st.download_button(
-                        "층별 정보 CSV 다운로드",
-                        data=floor_df.to_csv(index=False).encode("utf-8-sig"),
-                        file_name="building_floor_outline.csv",
-                        mime="text/csv",
-                    )
-                else:
-                    st.info("층별 정보가 없습니다.")
+        with tab_floors:
+            floor_tables = payload.get("floor_tables", [])
+            if floor_tables:
+                floor_df = pd.concat(floor_tables, ignore_index=True)
+                st.dataframe(floor_df, use_container_width=True, hide_index=True)
+                st.download_button(
+                    "층별 정보 CSV 다운로드",
+                    data=floor_df.to_csv(index=False).encode("utf-8-sig"),
+                    file_name="building_floor_outline.csv",
+                    mime="text/csv",
+                )
+            else:
+                st.info("층별 정보가 없습니다.")
 
-            with tab_units:
-                if not fetch_units:
-                    st.info("전유부 조회가 필요하면 전체 전유부 조회를 선택하거나 동/호를 입력하고 다시 조회하세요.")
-                if expos_tables:
-                    expos_df = pd.concat(expos_tables, ignore_index=True)
-                    st.subheader("전유부")
-                    st.dataframe(expos_df, use_container_width=True, hide_index=True)
-                    st.download_button(
-                        "전유부 CSV 다운로드",
-                        data=expos_df.to_csv(index=False).encode("utf-8-sig"),
-                        file_name="building_private_unit.csv",
-                        mime="text/csv",
-                    )
-                if pubuse_tables:
-                    pubuse_df = pd.concat(pubuse_tables, ignore_index=True)
-                    st.subheader("전유공용면적")
-                    st.dataframe(pubuse_df, use_container_width=True, hide_index=True)
-                    st.download_button(
-                        "전유공용면적 CSV 다운로드",
-                        data=pubuse_df.to_csv(index=False).encode("utf-8-sig"),
-                        file_name="building_private_common_area.csv",
-                        mime="text/csv",
-                    )
-                if fetch_units and not expos_tables and not pubuse_tables:
-                    st.info("해당 전유부 정보가 없거나 조회되지 않았습니다.")
-
-
-
-
+        with tab_units:
+            fetch_units = bool(payload.get("fetch_units"))
+            expos_tables = payload.get("expos_tables", [])
+            pubuse_tables = payload.get("pubuse_tables", [])
+            if not fetch_units:
+                st.info("전유부 조회가 필요하면 전체 전유부 조회를 선택하거나 동/호를 입력하고 다시 조회하세요.")
+            if expos_tables:
+                expos_df = pd.concat(expos_tables, ignore_index=True)
+                st.subheader("전유부")
+                st.dataframe(expos_df, use_container_width=True, hide_index=True)
+                st.download_button(
+                    "전유부 CSV 다운로드",
+                    data=expos_df.to_csv(index=False).encode("utf-8-sig"),
+                    file_name="building_private_unit.csv",
+                    mime="text/csv",
+                )
+            if pubuse_tables:
+                pubuse_df = pd.concat(pubuse_tables, ignore_index=True)
+                st.subheader("전유공용면적")
+                st.dataframe(pubuse_df, use_container_width=True, hide_index=True)
+                st.download_button(
+                    "전유공용면적 CSV 다운로드",
+                    data=pubuse_df.to_csv(index=False).encode("utf-8-sig"),
+                    file_name="building_private_common_area.csv",
+                    mime="text/csv",
+                )
+            if fetch_units and not expos_tables and not pubuse_tables:
+                st.info("해당 전유부 정보가 없거나 조회되지 않았습니다.")
 
 with tab_naver:
     render_naver_land_api_tab(kakao_key, juso_key, data_key)
