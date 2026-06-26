@@ -575,6 +575,12 @@ NON_LANDMARK_CATEGORY_KEYWORDS = (
     "스튜디오",
 )
 STORE_BRANCH_SUFFIXES = ("점",)
+CANDIDATE_OPTION_LIMIT = 6
+OVERALL_CANDIDATE_COUNT = 3
+TRANSIT_CANDIDATE_COUNT = 1
+LANDMARK_CANDIDATE_COUNT = 2
+TRANSIT_PRIORITY_GROUP = {0, 2, 90}
+LANDMARK_PRIORITY_GROUP = {1, 3, 4, 5}
 OTHER_TRANSIT_SEARCHES = (
     ({"query": "버스터미널"}, ("터미널",)),
     ({"query": "터미널"}, ("터미널",)),
@@ -633,14 +639,48 @@ def is_priority_public_place(name: str, category: str) -> bool:
     return is_generic_public_corp and is_public_category
 
 
+def candidate_key(candidate: NearbyCandidate) -> tuple[str, str]:
+    return candidate.station, candidate.walk_time
+
+
 def add_unique_candidate(candidates: list[NearbyCandidate], candidate: NearbyCandidate) -> None:
-    key = (candidate.station, candidate.walk_time)
+    key = candidate_key(candidate)
     for index, existing in enumerate(candidates):
-        if (existing.station, existing.walk_time) == key:
+        if candidate_key(existing) == key:
             if (candidate.priority, candidate.distance_m) < (existing.priority, existing.distance_m):
                 candidates[index] = candidate
             return
     candidates.append(candidate)
+
+
+def extend_unique_candidates(
+    selected: list[NearbyCandidate], pool: list[NearbyCandidate], count: int | None = None
+) -> None:
+    added = 0
+    selected_keys = {candidate_key(candidate) for candidate in selected}
+    for candidate in pool:
+        if len(selected) >= CANDIDATE_OPTION_LIMIT:
+            return
+        if count is not None and added >= count:
+            return
+        key = candidate_key(candidate)
+        if key in selected_keys:
+            continue
+        selected.append(candidate)
+        selected_keys.add(key)
+        added += 1
+
+
+def select_nearby_candidate_options(candidates: list[NearbyCandidate]) -> list[NearbyCandidate]:
+    sorted_candidates = sorted(candidates, key=lambda candidate: (candidate.priority, candidate.distance_m, candidate.station))
+    selected: list[NearbyCandidate] = []
+    extend_unique_candidates(selected, sorted_candidates, OVERALL_CANDIDATE_COUNT)
+    transit_candidates = [candidate for candidate in sorted_candidates if candidate.priority in TRANSIT_PRIORITY_GROUP]
+    extend_unique_candidates(selected, transit_candidates, TRANSIT_CANDIDATE_COUNT)
+    landmark_candidates = [candidate for candidate in sorted_candidates if candidate.priority in LANDMARK_PRIORITY_GROUP]
+    extend_unique_candidates(selected, landmark_candidates, LANDMARK_CANDIDATE_COUNT)
+    extend_unique_candidates(selected, sorted_candidates)
+    return selected[:CANDIDATE_OPTION_LIMIT]
 
 
 def collect_place_candidates(
@@ -753,8 +793,7 @@ def nearby_candidates_for_point(
         ):
             add_unique_candidate(candidates, candidate)
 
-    candidates.sort(key=lambda candidate: (candidate.priority, candidate.distance_m, candidate.station))
-    return candidates[:3]
+    return select_nearby_candidate_options(candidates)
 
 
 def nearby_candidates(address: str, kakao_key: str) -> list[NearbyCandidate]:
@@ -1524,7 +1563,7 @@ with tab_register:
                         candidates = getattr(result, "transit_candidates", [])
                         if candidates:
                             selected_index = st.selectbox(
-                                "인근 후보 Top 3",
+                                "인근 후보 6개",
                                 options=list(range(len(candidates))),
                                 format_func=lambda choice, candidates=candidates: candidate_display_label(candidates[choice]),
                                 key=f"transit_candidate_{payload.get('seq', 0)}_{index}",
