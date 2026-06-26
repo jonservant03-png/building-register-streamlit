@@ -523,6 +523,7 @@ PRIORITY_PUBLIC_QUERIES = (
     "국민연금공단 본부",
 )
 PRIORITY_GOV_KEYWORDS = ("구청", "시청", "도청", "검찰청", "법원")
+PRIORITY_GOV_CATEGORY_KEYWORDS = PRIORITY_GOV_KEYWORDS
 GENERIC_PUBLIC_CORP_KEYWORDS = ("공기업", "공단", "공사")
 SPECIFIC_PUBLIC_CORP_KEYWORDS = (
     "국민연금공단",
@@ -603,7 +604,9 @@ def is_priority_public_place(name: str, category: str) -> bool:
         return False
     if any(word in category for word in TRANSIT_CATEGORY_KEYWORDS):
         return False
-    if any(word in name for word in PRIORITY_GOV_KEYWORDS):
+    is_public_category = any(word in category for word in PUBLIC_CATEGORY_KEYWORDS)
+    is_priority_gov_category = any(word in category for word in PRIORITY_GOV_CATEGORY_KEYWORDS)
+    if is_public_category and is_priority_gov_category:
         return True
     is_hq = any(word in name for word in HQ_KEYWORDS)
     if not is_hq:
@@ -611,7 +614,6 @@ def is_priority_public_place(name: str, category: str) -> bool:
     if any(word in name for word in SPECIFIC_PUBLIC_CORP_KEYWORDS):
         return True
     is_generic_public_corp = any(word in name for word in GENERIC_PUBLIC_CORP_KEYWORDS)
-    is_public_category = any(word in category for word in PUBLIC_CATEGORY_KEYWORDS)
     return is_generic_public_corp and is_public_category
 
 
