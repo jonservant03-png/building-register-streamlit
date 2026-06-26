@@ -560,7 +560,10 @@ NON_LANDMARK_CATEGORY_KEYWORDS = (
     "의류",
     "패션",
     "문구",
+    "사진",
+    "스튜디오",
 )
+STORE_BRANCH_SUFFIXES = ("점",)
 OTHER_TRANSIT_SEARCHES = (
     ({"query": "버스터미널"}, ("터미널",)),
     ({"query": "터미널"}, ("터미널",)),
@@ -589,7 +592,13 @@ def landmark_label(name: str, distance_m: int | None = None) -> tuple[str, str]:
     return f"{name} 인근", ""
 
 
+def is_store_branch_name(name: str) -> bool:
+    return any(name.endswith(suffix) for suffix in STORE_BRANCH_SUFFIXES)
+
+
 def is_priority_public_place(name: str, category: str) -> bool:
+    if is_store_branch_name(name):
+        return False
     if any(word in category for word in NON_LANDMARK_CATEGORY_KEYWORDS):
         return False
     if any(word in category for word in TRANSIT_CATEGORY_KEYWORDS):
