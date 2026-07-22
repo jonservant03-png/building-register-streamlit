@@ -3,6 +3,7 @@ import io
 import json
 import re
 import shlex
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -159,30 +160,53 @@ def display_address(juso: JusoResult) -> str:
     return " ".join(tokens)
 
 
+# data.go.kr 백엔드는 정상 요청에도 간헐적으로 500(Error receiving response
+# from backend server)이나 타임아웃을 낸다. 이런 일시적 오류만 짧게 재시도한다.
+# 4xx(키/파라미터 오류)나 정상 응답은 즉시 반환해 불필요한 지연을 만들지 않는다.
+REQUEST_MAX_ATTEMPTS = 3
+REQUEST_RETRY_BACKOFF = (0.5, 1.0)
+
+
 def request_json(url: str, params: dict[str, Any], headers: dict[str, str] | None = None) -> dict[str, Any]:
-    try:
-        response = requests.get(url, params=params, headers=headers, timeout=20)
-    except requests.RequestException as exc:
-        raise ApiRequestError(f"API 연결 실패: {exc}") from exc
+    last_exc: ApiRequestError | None = None
+    for attempt in range(REQUEST_MAX_ATTEMPTS):
+        try:
+            response = requests.get(url, params=params, headers=headers, timeout=20)
+        except requests.RequestException as exc:
+            last_exc = ApiRequestError(f"API 연결 실패: {exc}")
+        else:
+            if response.status_code < 400:
+                try:
+                    return response.json()
+                except ValueError as exc:
+                    safe_url = sanitize_url(response.url)
+                    body = clean_text(response.text)[:300]
+                    raise ApiRequestError(f"JSON 응답을 읽지 못했습니다. URL: {safe_url}, 응답: {body}") from exc
 
-    if response.status_code >= 400:
-        safe_url = sanitize_url(response.url)
-        body = clean_text(response.text)[:300]
-        if "BldRgstService" in url and response.status_code >= 500:
-            raise ApiRequestError(
-                "건축물대장 API 서버 오류가 발생했습니다. "
-                "공공데이터포털에서 '국토교통부_건축물대장정보 서비스' 활용신청이 승인됐는지, "
-                "서비스키를 Decoding 키 또는 일반 인증키로 넣었는지 확인한 뒤 다시 시도하세요. "
-                f"상태코드: {response.status_code}, URL: {safe_url}, 응답: {body}"
-            )
-        raise ApiRequestError(f"API 요청 실패. 상태코드: {response.status_code}, URL: {safe_url}, 응답: {body}")
+            safe_url = sanitize_url(response.url)
+            body = clean_text(response.text)[:300]
+            if response.status_code >= 500:
+                if "BldRgstService" in url:
+                    last_exc = ApiRequestError(
+                        "건축물대장 API 서버 오류가 발생했습니다. "
+                        "공공데이터포털에서 '국토교통부_건축물대장정보 서비스' 활용신청이 승인됐는지, "
+                        "서비스키를 Decoding 키 또는 일반 인증키로 넣었는지 확인한 뒤 다시 시도하세요. "
+                        f"상태코드: {response.status_code}, URL: {safe_url}, 응답: {body}"
+                    )
+                else:
+                    last_exc = ApiRequestError(
+                        f"API 요청 실패. 상태코드: {response.status_code}, URL: {safe_url}, 응답: {body}"
+                    )
+            else:
+                # 4xx 등은 재시도해도 결과가 같으므로 즉시 실패 처리한다.
+                raise ApiRequestError(
+                    f"API 요청 실패. 상태코드: {response.status_code}, URL: {safe_url}, 응답: {body}"
+                )
 
-    try:
-        return response.json()
-    except ValueError as exc:
-        safe_url = sanitize_url(response.url)
-        body = clean_text(response.text)[:300]
-        raise ApiRequestError(f"JSON 응답을 읽지 못했습니다. URL: {safe_url}, 응답: {body}") from exc
+        if attempt < REQUEST_MAX_ATTEMPTS - 1:
+            time.sleep(REQUEST_RETRY_BACKOFF[min(attempt, len(REQUEST_RETRY_BACKOFF) - 1)])
+
+    raise last_exc if last_exc else ApiRequestError("API 요청이 반복 실패했습니다.")
 
 
 def normalize_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
