@@ -167,9 +167,15 @@ REQUEST_MAX_ATTEMPTS = 3
 REQUEST_RETRY_BACKOFF = (0.5, 1.0)
 
 
-def request_json(url: str, params: dict[str, Any], headers: dict[str, str] | None = None) -> dict[str, Any]:
+def request_json(
+    url: str,
+    params: dict[str, Any],
+    headers: dict[str, str] | None = None,
+    max_attempts: int = REQUEST_MAX_ATTEMPTS,
+) -> dict[str, Any]:
     last_exc: ApiRequestError | None = None
-    for attempt in range(REQUEST_MAX_ATTEMPTS):
+    attempts = max(1, max_attempts)
+    for attempt in range(attempts):
         try:
             response = requests.get(url, params=params, headers=headers, timeout=20)
         except requests.RequestException as exc:
@@ -203,7 +209,7 @@ def request_json(url: str, params: dict[str, Any], headers: dict[str, str] | Non
                     f"API 요청 실패. 상태코드: {response.status_code}, URL: {safe_url}, 응답: {body}"
                 )
 
-        if attempt < REQUEST_MAX_ATTEMPTS - 1:
+        if attempt < attempts - 1:
             time.sleep(REQUEST_RETRY_BACKOFF[min(attempt, len(REQUEST_RETRY_BACKOFF) - 1)])
 
     raise last_exc if last_exc else ApiRequestError("API 요청이 반복 실패했습니다.")
@@ -319,12 +325,18 @@ def building_params(juso: JusoResult, service_key: str, rows: int = 100) -> dict
     }
 
 
-def fetch_building_api(endpoint: str, juso: JusoResult, data_key: str, rows: int = 100) -> list[dict[str, Any]]:
+def fetch_building_api(
+    endpoint: str,
+    juso: JusoResult,
+    data_key: str,
+    rows: int = 100,
+    max_attempts: int = REQUEST_MAX_ATTEMPTS,
+) -> list[dict[str, Any]]:
     errors: list[str] = []
     for index, service_key in enumerate(data_key_candidates(data_key), start=1):
         params = building_params(juso, service_key, rows=rows)
         try:
-            data = request_json(f"{BUILDING_API_BASE}/{endpoint}", params)
+            data = request_json(f"{BUILDING_API_BASE}/{endpoint}", params, max_attempts=max_attempts)
             ensure_success_response(data)
             return normalize_items(data)
         except ApiRequestError as exc:
@@ -339,6 +351,7 @@ def fetch_building_api_with_extra(
     data_key: str,
     rows: int = 100,
     extra_params: dict[str, Any] | None = None,
+    max_attempts: int = REQUEST_MAX_ATTEMPTS,
 ) -> list[dict[str, Any]]:
     errors: list[str] = []
     for index, service_key in enumerate(data_key_candidates(data_key), start=1):
@@ -346,7 +359,7 @@ def fetch_building_api_with_extra(
         if extra_params:
             params.update(extra_params)
         try:
-            data = request_json(f"{BUILDING_API_BASE}/{endpoint}", params)
+            data = request_json(f"{BUILDING_API_BASE}/{endpoint}", params, max_attempts=max_attempts)
             ensure_success_response(data)
             return normalize_items(data)
         except ApiRequestError as exc:
@@ -373,7 +386,9 @@ def fetch_building_title(juso: JusoResult, data_key: str) -> dict[str, Any] | No
 
 
 def fetch_floor_outline(juso: JusoResult, data_key: str) -> pd.DataFrame:
-    rows = fetch_building_api("getBrFlrOulnInfo", juso, data_key, rows=300)
+    # 층별 정보는 부가 탭 전용이라 실패해도 표제부 결과를 유지한다.
+    # 백엔드가 불안정할 때 재시도로 시간을 끌지 않도록 1회만 시도한다.
+    rows = fetch_building_api("getBrFlrOulnInfo", juso, data_key, rows=300, max_attempts=1)
     records: list[dict[str, str]] = []
     for row in rows:
         area_sqm = row.get("area")
@@ -441,9 +456,11 @@ def fetch_private_unit(juso: JusoResult, data_key: str, dong_nm: str, ho_nm: str
     if ho_nm:
         extra_params["hoNm"] = ho_nm
 
-    expos_rows = fetch_building_api_with_extra("getBrExposInfo", juso, data_key, rows=300, extra_params=extra_params)
+    expos_rows = fetch_building_api_with_extra(
+        "getBrExposInfo", juso, data_key, rows=300, extra_params=extra_params, max_attempts=1
+    )
     pubuse_rows = fetch_building_api_with_extra(
-        "getBrExposPubuseAreaInfo", juso, data_key, rows=300, extra_params=extra_params
+        "getBrExposPubuseAreaInfo", juso, data_key, rows=300, extra_params=extra_params, max_attempts=1
     )
 
     if dong_nm or ho_nm:
@@ -1370,7 +1387,11 @@ def lookup(address: str, juso_key: str, data_key: str, kakao_key: str) -> tuple[
     if not building:
         raise RuntimeError("건축물대장 표제부를 찾지 못했습니다.")
 
-    floors_df = fetch_floor_outline(juso, data_key)
+    # 층별 정보 실패는 치명적이지 않다. 표제부만 있으면 카드/요약은 채운다.
+    try:
+        floors_df = fetch_floor_outline(juso, data_key)
+    except Exception:
+        floors_df = pd.DataFrame()
     try:
         transit_candidates = nearby_candidates(juso.road_addr, kakao_key) if kakao_key else []
         if transit_candidates:
@@ -1582,9 +1603,13 @@ with tab_register:
 
                         if fetch_units:
                             for unit_query in queries_to_fetch:
-                                expos_df, pubuse_df = fetch_private_unit(
-                                    juso, data_key, unit_query.dong_nm, unit_query.ho_nm
-                                )
+                                # 전유부 조회 실패는 부가 정보이므로 행 전체를 버리지 않는다.
+                                try:
+                                    expos_df, pubuse_df = fetch_private_unit(
+                                        juso, data_key, unit_query.dong_nm, unit_query.ho_nm
+                                    )
+                                except Exception:
+                                    continue
                                 if not expos_df.empty:
                                     expos_with_address = expos_df.copy()
                                     expos_with_address.insert(0, "조회동호", unit_query.label)
