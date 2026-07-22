@@ -273,13 +273,19 @@ def data_key_candidates(data_key: str) -> list[str]:
 
 
 def building_params(juso: JusoResult, service_key: str, rows: int = 100) -> dict[str, Any]:
-    if len(juso.adm_cd) < 10:
+    # 법정동코드는 bd_mgt_sn(건물관리번호) 앞 10자리를 우선 사용한다.
+    # 신규 통합시(전남광주통합특별시 등)의 adm_cd는 건축물대장 API가 아직
+    # 인식하지 못해 빈 결과를 반환하나, bd_mgt_sn에는 구 코드가 남아 조회된다.
+    code = only_digits(juso.bd_mgt_sn)[:10]
+    if len(code) < 10:
+        code = juso.adm_cd
+    if len(code) < 10:
         raise RuntimeError("도로명주소 결과에서 법정동코드를 찾지 못했습니다.")
 
     return {
         "serviceKey": service_key,
-        "sigunguCd": juso.adm_cd[:5],
-        "bjdongCd": juso.adm_cd[5:10],
+        "sigunguCd": code[:5],
+        "bjdongCd": code[5:10],
         "platGbCd": "1" if juso.mt_yn == "1" else "0",
         "bun": only_digits(juso.lnbr_mnnm),
         "ji": only_digits(juso.lnbr_slno),
