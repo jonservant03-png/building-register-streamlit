@@ -203,7 +203,25 @@ def ensure_success_response(payload: dict[str, Any]) -> None:
         raise ApiRequestError(f"공공데이터포털 응답 오류: {code} {message}")
 
 
-def search_juso(keyword: str, juso_key: str) -> JusoResult | None:
+# juso DB에 아직 반영되지 않은 신규/통합 시도명 (인식 실패 시 제거 대상)
+# 향후 juso가 업데이트되면 이 목록을 비우거나 정리하세요.
+UNRESOLVED_SIDO = (
+    "전남광주통합특별시",
+    "광주특별시",
+)
+
+
+def normalize_address_for_juso(address: str) -> str:
+    """juso가 인식 못 하는 신규 시도 접두어를 제거해 매칭 성공률을 높인다."""
+    text = clean_text(address)
+    for name in UNRESOLVED_SIDO:
+        if text.startswith(name):
+            return text[len(name):].strip()
+    return text
+
+
+def _juso_request(keyword: str, juso_key: str) -> list[dict]:
+    """juso addrLinkApi 호출 후 juso 목록 반환. 오류코드는 예외 처리."""
     data = request_json(
         JUSO_API_URL,
         {
@@ -217,8 +235,19 @@ def search_juso(keyword: str, juso_key: str) -> JusoResult | None:
     common = data.get("results", {}).get("common", {})
     if common.get("errorCode") != "0":
         raise RuntimeError(common.get("errorMessage", "도로명주소 API 조회 실패"))
+    return data.get("results", {}).get("juso", [])
 
-    items = data.get("results", {}).get("juso", [])
+
+def search_juso(keyword: str, juso_key: str) -> JusoResult | None:
+    # 1차: 신규 시도명 접두어 제거 후 검색
+    items = _juso_request(normalize_address_for_juso(keyword), juso_key)
+
+    # 2차: 그래도 결과가 없으면 맨 앞 토큰(시도 추정)을 한 번 더 떼고 재시도
+    if not items:
+        tokens = clean_text(keyword).split()
+        if len(tokens) > 1:
+            items = _juso_request(" ".join(tokens[1:]), juso_key)
+
     if not items:
         return None
 
